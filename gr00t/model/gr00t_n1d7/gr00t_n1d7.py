@@ -95,6 +95,18 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
+        if config.use_third_view_aux_loss:
+            self.learnable_queries = nn.Parameter(
+                torch.empty(config.num_learnable_queries, self.input_embedding_dim)
+            )
+            self.query_head = nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, config.query_ffn_hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.query_ffn_hidden_dim, config.backbone_embedding_dim),
+            )
+            self.initialize_third_view_aux_parameters()
+
         # State dropout parameters
         self.state_dropout_prob = config.state_dropout_prob
 
@@ -118,6 +130,13 @@ class Gr00tN1d7ActionHead(nn.Module):
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
 
+    def initialize_third_view_aux_parameters(self) -> None:
+        """Explicitly initialize parameters that are absent from legacy checkpoints."""
+        nn.init.normal_(self.learnable_queries, mean=0.0, std=0.02)
+        for module in self.query_head.modules():
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
     def set_trainable_parameters(
         self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
     ):
@@ -132,6 +151,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
+            if self.config.use_third_view_aux_loss:
+                self.learnable_queries.requires_grad_(False)
+                self.query_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         if not tune_vlln:
@@ -161,6 +183,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.action_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
+                if self.config.use_third_view_aux_loss:
+                    self.query_head.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
             if not self.tune_vlln:
@@ -178,6 +202,81 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _action_backbone_output(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> BatchFeature:
+        """Extract and left-pad user-1 before the trainable VL postprocessor."""
+        if not self.config.use_third_view_aux_loss:
+            return BatchFeature(data=dict(backbone_output))
+
+        if "first_user_end" not in action_input:
+            return BatchFeature(
+                data={
+                    "backbone_features": backbone_output.backbone_features.detach(),
+                    "backbone_attention_mask": backbone_output.backbone_attention_mask,
+                    "image_mask": backbone_output.image_mask,
+                }
+            )
+
+        boundaries = action_input.first_user_end.long()
+        max_length = int(boundaries.max())
+
+        def pack_prefix(tensor: torch.Tensor) -> torch.Tensor:
+            if torch.is_floating_point(tensor):
+                tensor = tensor.detach()
+            output = tensor.new_zeros((tensor.shape[0], max_length, *tensor.shape[2:]))
+            for row, boundary in enumerate(boundaries.tolist()):
+                output[row, max_length - boundary :] = tensor[row, :boundary]
+            return output
+
+        return BatchFeature(
+            data={
+                "backbone_features": pack_prefix(backbone_output.backbone_features),
+                "backbone_attention_mask": pack_prefix(
+                    backbone_output.backbone_attention_mask
+                ),
+                "image_mask": pack_prefix(backbone_output.image_mask),
+            }
+        )
+
+    def _third_view_target(
+        self, backbone_output: BatchFeature, action_input: BatchFeature
+    ) -> torch.Tensor:
+        third_mask = action_input.third_view_token_mask.bool()
+        features = backbone_output.backbone_features.detach()
+
+        if self.config.query_target_stage == "vl_postprocessor":
+            batch_size, seq_len = third_mask.shape
+            positions = torch.arange(seq_len, device=features.device).unsqueeze(0)
+            first_mask = positions < action_input.first_user_end.unsqueeze(1)
+            valid_mask = backbone_output.backbone_attention_mask.bool()
+            second_mask = valid_mask & ~first_mask
+            allowed = valid_mask.unsqueeze(1) & (
+                first_mask.unsqueeze(1) | second_mask.unsqueeze(2)
+            )
+            attention_bias = torch.zeros(
+                (batch_size, seq_len, seq_len), dtype=features.dtype, device=features.device
+            ).masked_fill(~allowed, torch.finfo(features.dtype).min)
+
+            vlln_was_training = self.vlln.training
+            vl_was_training = self.vl_self_attention.training
+            self.vlln.eval()
+            self.vl_self_attention.eval()
+            try:
+                with torch.no_grad():
+                    features = self.vlln(features)
+                    features = self.vl_self_attention(features, attention_mask=attention_bias)
+            finally:
+                self.vlln.train(vlln_was_training)
+                self.vl_self_attention.train(vl_was_training)
+
+        batch_size = features.shape[0]
+        return features[third_mask].view(
+            batch_size,
+            self.config.num_learnable_queries,
+            self.config.backbone_embedding_dim,
+        )
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -200,6 +299,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
+        full_backbone_output = backbone_output
+        backbone_output = self._action_backbone_output(backbone_output, action_input)
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -244,8 +345,13 @@ class Gr00tN1d7ActionHead(nn.Module):
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
-        # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        # Learned queries share every action-expert self/cross-attention operation,
+        # but intentionally receive no action position embedding.
+        if self.config.use_third_view_aux_loss:
+            query_features = self.learnable_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
+            sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+        else:
+            sa_embs = torch.cat((state_features, action_features), dim=1)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -275,15 +381,32 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        fm_loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
+        if self.config.use_third_view_aux_loss:
+            query_output = model_output[:, 1 : 1 + self.config.num_learnable_queries]
+            query_prediction = self.query_head(query_output)
+            query_target = self._third_view_target(full_backbone_output, action_input)
+            query_mse_loss = F.mse_loss(query_prediction, query_target, reduction="mean")
+            loss = (
+                self.config.fm_loss_weight * fm_loss
+                + self.config.query_mse_loss_weight * query_mse_loss
+            )
+        else:
+            query_mse_loss = None
+            loss = fm_loss
+
+        output = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+        if query_mse_loss is not None:
+            output["fm_loss"] = fm_loss
+            output["query_mse_loss"] = query_mse_loss
+        return output
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -304,6 +427,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - backbone_features: [B, seq_len, backbone_embedding_dim]
                 - state_features: [B, 1, input_embedding_dim]
         """
+        backbone_output = self._action_backbone_output(backbone_output, action_input)
         backbone_output = self.process_backbone_output(backbone_output)
 
         # Get vision and language embeddings.
@@ -409,8 +533,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            if self.config.use_third_view_aux_loss:
+                query_features = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
+                sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+            else:
+                sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
@@ -548,6 +675,8 @@ class Gr00tN1d7(PreTrainedModel):
             model_name=config.model_name,
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            use_third_view_aux_loss=config.use_third_view_aux_loss,
+            num_learnable_queries=config.num_learnable_queries,
         )
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:

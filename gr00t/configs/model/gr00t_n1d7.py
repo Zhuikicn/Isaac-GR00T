@@ -114,6 +114,17 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
 
+    # Third-view representation auxiliary objective. This is intentionally
+    # opt-in so checkpoints and processors created before this feature retain
+    # their exact architecture and behavior.
+    use_third_view_aux_loss: bool = False
+    third_view_key: str = "third_view"
+    num_learnable_queries: int = 112
+    query_target_stage: str = "raw_cosmos"
+    fm_loss_weight: float = 1.0
+    query_mse_loss_weight: float = 1.0
+    query_ffn_hidden_dim: int = 4096
+
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
     exclude_state: bool = False  # Zero out all state inputs (ablation)

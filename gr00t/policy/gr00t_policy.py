@@ -20,6 +20,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -159,10 +160,17 @@ class Gr00tPolicy(BasePolicy):
                 f"{hint}"
             )
         self.modality_configs = {
-            k: v
+            k: deepcopy(v)
             for k, v in all_modality_configs[self.embodiment_tag.value].items()
             if k != "rl_info"
         }
+        third_view_key = getattr(self.processor, "third_view_key", None)
+        if third_view_key is not None:
+            self.modality_configs["video"].modality_keys = [
+                key
+                for key in self.modality_configs["video"].modality_keys
+                if key != third_view_key
+            ]
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration

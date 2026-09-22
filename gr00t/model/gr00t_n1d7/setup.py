@@ -87,6 +87,13 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
+                third_view_key=self.config.model.third_view_key,
+                num_learnable_queries=self.config.model.num_learnable_queries,
+                query_target_stage=self.config.model.query_target_stage,
+                fm_loss_weight=self.config.model.fm_loss_weight,
+                query_mse_loss_weight=self.config.model.query_mse_loss_weight,
+                query_ffn_hidden_dim=self.config.model.query_ffn_hidden_dim,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -105,7 +112,38 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            aux_key_prefixes = (
+                "action_head.learnable_queries",
+                "action_head.query_head.",
+            )
+            expected_legacy_aux_missing = {
+                "action_head.learnable_queries",
+                "action_head.query_head.0.weight",
+                "action_head.query_head.0.bias",
+                "action_head.query_head.1.weight",
+                "action_head.query_head.1.bias",
+                "action_head.query_head.3.weight",
+                "action_head.query_head.3.bias",
+            }
+            actual_aux_missing = {
+                key for key in missing_keys if key.startswith(aux_key_prefixes)
+            }
+            initialize_legacy_aux = (
+                self.config.model.use_third_view_aux_loss
+                and actual_aux_missing == expected_legacy_aux_missing
+            )
+            other_missing = [
+                k
+                for k in missing_keys
+                if "mask_token" not in k
+                and not (initialize_legacy_aux and k in expected_legacy_aux_missing)
+            ]
+            if initialize_legacy_aux:
+                model.action_head.initialize_third_view_aux_parameters()
+                logging.info(
+                    "Third-view auxiliary parameters not in checkpoint; initialized: %s",
+                    sorted(expected_legacy_aux_missing),
+                )
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -180,6 +218,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
+                third_view_key=self.model_config.third_view_key,
+                num_learnable_queries=self.model_config.num_learnable_queries,
                 **self.transformers_loading_kwargs,
             )
         else:
@@ -209,6 +250,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 use_mean_std=self.model_config.use_mean_std,
+                use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
+                third_view_key=self.model_config.third_view_key,
+                num_learnable_queries=self.model_config.num_learnable_queries,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 

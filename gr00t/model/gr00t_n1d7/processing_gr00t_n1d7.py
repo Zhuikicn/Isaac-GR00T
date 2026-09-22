@@ -162,6 +162,8 @@ class Gr00tN1d7DataCollator:
         model_name: str,
         model_type: str = "qwen",
         transformers_loading_kwargs: dict = {},
+        use_third_view_aux_loss: bool = False,
+        num_learnable_queries: int = 112,
     ):
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -169,6 +171,8 @@ class Gr00tN1d7DataCollator:
         self.processor.tokenizer.padding_side = "left"
         self.model_type = model_type
         self.model_name = model_name
+        self.use_third_view_aux_loss = use_third_view_aux_loss
+        self.num_learnable_queries = num_learnable_queries
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -195,6 +199,33 @@ class Gr00tN1d7DataCollator:
                 )
                 for k, v in vlm_inputs.items():
                     batch[k] = v
+                if self.use_third_view_aux_loss:
+                    seq_len = vlm_inputs["input_ids"].shape[1]
+                    im_start_id = self.processor.tokenizer.convert_tokens_to_ids(
+                        "<|im_start|>"
+                    )
+                    image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+                        "<|image_pad|>"
+                    )
+                    first_user_end = []
+                    third_view_token_mask = torch.zeros_like(
+                        vlm_inputs["input_ids"], dtype=torch.bool
+                    )
+                    for row, content in enumerate(values):
+                        starts = torch.nonzero(
+                            vlm_inputs["input_ids"][row] == im_start_id, as_tuple=False
+                        ).flatten()
+                        has_third = content.get("has_third_view_aux", False)
+                        boundary = int(starts[1]) if has_third else seq_len
+                        first_user_end.append(boundary)
+                        if has_third:
+                            positions = torch.arange(seq_len)
+                            third_view_token_mask[row] = (
+                                (vlm_inputs["input_ids"][row] == image_token_id)
+                                & (positions >= boundary)
+                            )
+                    batch["first_user_end"] = torch.tensor(first_user_end, dtype=torch.long)
+                    batch["third_view_token_mask"] = third_view_token_mask
             elif key in (
                 "pixel_values",
                 "image_grid_thw",
@@ -244,6 +275,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Normalization
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
+        use_third_view_aux_loss: bool = False,
+        third_view_key: str = "third_view",
+        num_learnable_queries: int = 112,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 
@@ -275,6 +309,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.formalize_language = formalize_language
         self.model_name = model_name
         self.model_type = model_type
+        self.use_third_view_aux_loss = use_third_view_aux_loss
+        self.third_view_key = third_view_key
+        self.num_learnable_queries = num_learnable_queries
 
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
@@ -327,6 +364,8 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_name=model_name,
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            use_third_view_aux_loss=use_third_view_aux_loss,
+            num_learnable_queries=num_learnable_queries,
         )
         self.train()
 
@@ -486,6 +525,9 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         image_keys = modality_config["video"].modality_keys
+        # third_view is a training-only auxiliary input and is never required
+        # by the inference observation contract.
+        image_keys = [key for key in image_keys if key != self.third_view_key]
         images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
         images = torch.stack(
             [images_dict[view] for view in image_keys], dim=2
@@ -543,7 +585,12 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         return BatchFeature(transformed_observation)
 
-    def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
+    def _apply_vlm_processing(
+        self,
+        images: np.ndarray,
+        language: str,
+        third_images: np.ndarray | None = None,
+    ) -> BatchFeature:
         """
         Args:
             batch:
@@ -562,6 +609,17 @@ class Gr00tN1d7Processor(BaseProcessor):
                 ],
             }
         ]
+        third_frames = []
+        if third_images is not None:
+            third_frames = [torch.as_tensor(v) for v in third_images]
+            conversation.append(
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": img} for img in third_frames],
+                    ],
+                }
+            )
 
         # Apply chat template but don't process yet - let collator handle it
         text = self.processor.apply_chat_template(
@@ -572,8 +630,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         return {
             "vlm_content": {
                 "text": text,
-                "images": frames,
+                "images": frames + third_frames,
                 "conversation": conversation,
+                "has_third_view_aux": bool(third_frames),
             }
         }
 
@@ -673,6 +732,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         else:
             image_transform = self.eval_image_transform
         image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
+        if not self.use_third_view_aux_loss or self.third_view_key not in content.images:
+            image_keys = [key for key in image_keys if key != self.third_view_key]
 
         if self.formalize_language:
             language = content.text.lower()
@@ -744,11 +805,19 @@ class Gr00tN1d7Processor(BaseProcessor):
             assert v.dtype == torch.uint8, f"{v} is not a uint8 tensor"
             assert v.shape[1] == 3, f"{v} is not a 3 channel tensor"
 
-        stacked_images = torch.stack(
-            [temporal_stacked_images[view] for view in image_keys], dim=1
-        ).flatten(0, 1)  # (T*V, C, H, W)
+        if self.use_third_view_aux_loss and self.third_view_key in temporal_stacked_images:
+            ego_keys = [view for view in image_keys if view != self.third_view_key]
+            stacked_images = torch.stack(
+                [temporal_stacked_images[view] for view in ego_keys], dim=1
+            ).flatten(0, 1)
+            third_images = temporal_stacked_images[self.third_view_key]
+        else:
+            stacked_images = torch.stack(
+                [temporal_stacked_images[view] for view in image_keys], dim=1
+            ).flatten(0, 1)
+            third_images = None
 
-        vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+        vlm_inputs = self._apply_vlm_processing(stacked_images, language, third_images)
         return vlm_inputs
 
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
@@ -775,6 +844,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "model_name": self.model_name,
                 "model_type": self.model_type,
                 "formalize_language": self.formalize_language,
+                "use_third_view_aux_loss": self.use_third_view_aux_loss,
+                "third_view_key": self.third_view_key,
+                "num_learnable_queries": self.num_learnable_queries,
                 # State action dimensions
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
@@ -877,6 +949,9 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "use_third_view_aux_loss",
+                "third_view_key",
+                "num_learnable_queries",
             ]
             for key in override_keys:
                 if key in kwargs:

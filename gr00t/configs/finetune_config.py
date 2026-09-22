@@ -58,6 +58,18 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    use_third_view_aux_loss: bool = False
+    """Enable learnable action-expert queries supervised by the third-view representation."""
+
+    query_target_stage: str = "raw_cosmos"
+    """Third-view target source: raw_cosmos or vl_postprocessor."""
+
+    fm_loss_weight: float = 1.0
+    """Alpha multiplier for the flow-matching loss."""
+
+    query_mse_loss_weight: float = 1.0
+    """Beta multiplier for the query-to-third-view MSE loss."""
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.
