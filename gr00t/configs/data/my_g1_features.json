@@ -131,7 +131,8 @@
       }
     },
     "video": {
-      "ego_view": {"original_key": "observation.images.ego_view"}
+      "ego_view": {"original_key": "observation.images.ego_view"},
+      "third_view":{"original_key": "observation.images.third_person"}
     },
     "annotation": {
       "human.task_description": {"original_key": "task_index"}
