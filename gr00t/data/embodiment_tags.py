@@ -50,7 +50,7 @@ class EmbodimentTag(Enum):
     - NEW_EMBODIMENT        -> "new_embodiment"
     - ROBOCASA_PANDA_OMRON  -> "robocasa_panda_omron"
     - ROBOCASA_GR1_TABLETOP -> "robocasa_gr1_tabletop"
-
+    - MY_G1                 -> "my g1 data"
     Use ``EmbodimentTag.resolve(s)`` to look up a tag by name or value,
     case-insensitively.
     """
@@ -129,7 +129,7 @@ class EmbodimentTag(Enum):
     """
     Any new embodiment.
     """
-
+    MY_G1 = "my_g1"
     ROBOCASA_GR1_TABLETOP = "robocasa_gr1_tabletop"
     """
     RoboCasa GR1 tabletop tasks with arms, waist, and Fourier hands.

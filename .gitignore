@@ -139,7 +139,7 @@ cython_debug/
 .venv/*
 env/
 venv/
-
+.conda-pkgs/*
 # Mujoco
 MUJOCO_LOG.TXT
 playground/
@@ -168,3 +168,5 @@ offline_open_loop_eval_plots/
 # Generic model/data folders
 /models
 /data
+.conda-pkgs/*
+.cuda-12.8/*
