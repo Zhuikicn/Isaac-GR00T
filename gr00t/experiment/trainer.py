@@ -283,20 +283,17 @@ class Gr00tTrainer(Trainer):
         # Record last loss for testing purposes.
         self.loss = loss
 
-        # Auxiliary third-view losses are returned by the action model only
-        # when ``use_third_view_aux_loss`` is enabled. Log their distributed
-        # means alongside the total training loss so every Trainer reporter
-        # (including wandb) receives the individual loss terms.
+        # Log the distributed mean of the FM loss alongside the total training
+        # loss. When third-view supervision is enabled, log its MSE term too.
+        # Every Trainer reporter (including wandb) receives these metrics.
         if (
             model.training
             and self.state.global_step % self.args.logging_steps == 0
             and "fm_loss" in outputs
-            and "query_mse_loss" in outputs
         ):
-            aux_losses = {
-                "fm_loss": outputs["fm_loss"].detach(),
-                "mse_loss": outputs["query_mse_loss"].detach(),
-            }
+            aux_losses = {"fm_loss": outputs["fm_loss"].detach()}
+            if "query_mse_loss" in outputs:
+                aux_losses["mse_loss"] = outputs["query_mse_loss"].detach()
             aux_loss_means = {
                 name: self._nested_gather(value).mean().item()
                 for name, value in aux_losses.items()

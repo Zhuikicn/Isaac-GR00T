@@ -398,13 +398,13 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         output = {
             "loss": loss,
+            "fm_loss": fm_loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
         if query_mse_loss is not None:
-            output["fm_loss"] = fm_loss
             output["query_mse_loss"] = query_mse_loss
         return output
 
