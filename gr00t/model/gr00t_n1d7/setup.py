@@ -88,6 +88,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
+                mask_query_action_attention=self.config.model.mask_query_action_attention,
                 third_view_key=self.config.model.third_view_key,
                 num_learnable_queries=self.config.model.num_learnable_queries,
                 query_target_stage=self.config.model.query_target_stage,
@@ -125,9 +126,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 "action_head.query_head.3.weight",
                 "action_head.query_head.3.bias",
             }
-            actual_aux_missing = {
-                key for key in missing_keys if key.startswith(aux_key_prefixes)
-            }
+            actual_aux_missing = {key for key in missing_keys if key.startswith(aux_key_prefixes)}
             initialize_legacy_aux = (
                 self.config.model.use_third_view_aux_loss
                 and actual_aux_missing == expected_legacy_aux_missing

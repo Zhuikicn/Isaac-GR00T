@@ -61,6 +61,9 @@ class FinetuneConfig:
     use_third_view_aux_loss: bool = False
     """Enable learnable action-expert queries supervised by the third-view representation."""
 
+    mask_query_action_attention: bool = False
+    """Prevent learnable queries from attending to action tokens in DiT self-attention."""
+
     query_target_stage: str = "raw_cosmos"
     """Third-view target source: raw_cosmos or vl_postprocessor."""
 
