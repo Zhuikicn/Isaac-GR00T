@@ -81,6 +81,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
+                # The checkpoint serializes the Hub model ID. During offline
+                # training this override points the backbone at the resolved
+                # local Cosmos snapshot instead.
+                model_name=self.model_config.model_name,
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
                 tune_projector=self.config.model.tune_projector,

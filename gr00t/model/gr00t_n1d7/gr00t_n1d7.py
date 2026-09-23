@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+from pathlib import Path
 from typing import Any, Tuple
 
 import torch
@@ -615,7 +616,15 @@ class Gr00tN1d7ActionHead(nn.Module):
 
 
 def get_backbone_cls(config: Gr00tN1d7Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    model_name = config.model_name
+    # Fine-tuning may resolve a cached/gated Cosmos model ID to its local
+    # snapshot directory.  The directory has the same Qwen3-VL architecture
+    # even though its path no longer contains the original Hub model ID.
+    if (
+        "nvidia/Cosmos-Reason2" in model_name
+        or "Qwen/Qwen3-VL" in model_name
+        or Path(model_name).is_dir()
+    ):
         # We import here as Qwen3Backbone depends on newer transformers versions than the rest of the code.
         from gr00t.model.modules.qwen3_backbone import Qwen3Backbone
 

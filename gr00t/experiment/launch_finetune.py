@@ -27,6 +27,46 @@ from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.experiment.experiment import run
 
 
+def resolve_local_hf_snapshot(model_path: str) -> str:
+    """Use a complete local Hugging Face snapshot when one is available.
+
+    This research node keeps model caches under the persistent workspace rather
+    than the process default (``~/.cache``).  Resolving the snapshot to a
+    directory also prevents Transformers from issuing a Hub metadata request,
+    which is important for locally cached gated models such as Cosmos.
+    """
+    if Path(model_path).is_dir():
+        return model_path
+
+    cache_roots = []
+    if cache_root := os.environ.get("GR00T_HF_HUB_CACHE"):
+        cache_roots.append(Path(cache_root))
+    if cache_root := os.environ.get("HF_HUB_CACHE"):
+        cache_roots.append(Path(cache_root))
+    if hf_home := os.environ.get("HF_HOME"):
+        cache_roots.append(Path(hf_home) / "hub")
+    cache_roots.extend(
+        [
+            Path("/mnt/afs/250010023/cxh/.cache/huggingface/hub"),
+            Path.home() / ".cache/huggingface/hub",
+        ]
+    )
+
+    repo_cache_name = f"models--{model_path.replace('/', '--')}"
+    for cache_root in cache_roots:
+        repo_cache = cache_root / repo_cache_name
+        ref_file = repo_cache / "refs" / "main"
+        if not ref_file.is_file():
+            continue
+        revision = ref_file.read_text(encoding="utf-8").strip()
+        snapshot = repo_cache / "snapshots" / revision
+        if (snapshot / "config.json").is_file():
+            print(f"Using local Hugging Face snapshot for {model_path}: {snapshot}")
+            return str(snapshot)
+
+    return model_path
+
+
 # Make sure the user provided modality config is registered.
 def load_modality_config(modality_config_path: str):
     import importlib
@@ -101,12 +141,13 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+    config.model.model_name = resolve_local_hf_snapshot("nvidia/Cosmos-Reason2-2B")
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
 
     config.training.experiment_name = ft_config.experiment_name
-    config.training.start_from_checkpoint = ft_config.base_model_path
+    config.training.start_from_checkpoint = resolve_local_hf_snapshot(ft_config.base_model_path)
+    config.training.transformers_local_files_only = True
     config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
