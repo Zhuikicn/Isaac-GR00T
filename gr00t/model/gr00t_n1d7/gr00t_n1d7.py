@@ -47,9 +47,23 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
+        if config.use_action_query_gate:
+            if not config.use_third_view_aux_loss:
+                raise ValueError("use_action_query_gate requires use_third_view_aux_loss=True")
+            if config.mask_query_action_attention:
+                raise ValueError("use_action_query_gate requires mask_query_action_attention=False")
+            if config.num_learnable_queries <= 0:
+                raise ValueError("use_action_query_gate requires num_learnable_queries > 0")
+
+        gate_config = dict(
+            use_action_query_gate=config.use_action_query_gate,
+            query_gate_init_prob=config.query_gate_init_prob,
+        )
+
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
+                **gate_config,
                 cross_attention_dim=config.backbone_embedding_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
             )
@@ -57,6 +71,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         else:
             self.model = DiT(
                 **config.diffusion_model_cfg,
+                **gate_config,
                 cross_attention_dim=config.backbone_embedding_dim,
             )
             logger.info("Using DiT for diffusion model")
@@ -137,6 +152,19 @@ class Gr00tN1d7ActionHead(nn.Module):
         for module in self.query_head.modules():
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
+
+    def _query_action_self_attention_mask(
+        self, hidden_states: torch.Tensor, num_state_tokens: int
+    ) -> torch.Tensor | None:
+        """Mask action keys only for learnable-query rows in DiT self-attention."""
+        if not (self.config.use_third_view_aux_loss and self.config.mask_query_action_attention):
+            return None
+
+        batch_size, seq_len = hidden_states.shape[:2]
+        query_end = num_state_tokens + self.config.num_learnable_queries
+        mask = hidden_states.new_zeros((batch_size, seq_len, seq_len))
+        mask[:, num_state_tokens:query_end, query_end:] = torch.finfo(mask.dtype).min
+        return mask
 
     def set_trainable_parameters(
         self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
@@ -234,9 +262,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(
             data={
                 "backbone_features": pack_prefix(backbone_output.backbone_features),
-                "backbone_attention_mask": pack_prefix(
-                    backbone_output.backbone_attention_mask
-                ),
+                "backbone_attention_mask": pack_prefix(backbone_output.backbone_attention_mask),
                 "image_mask": pack_prefix(backbone_output.image_mask),
             }
         )
@@ -253,9 +279,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             first_mask = positions < action_input.first_user_end.unsqueeze(1)
             valid_mask = backbone_output.backbone_attention_mask.bool()
             second_mask = valid_mask & ~first_mask
-            allowed = valid_mask.unsqueeze(1) & (
-                first_mask.unsqueeze(1) | second_mask.unsqueeze(2)
-            )
+            allowed = valid_mask.unsqueeze(1) & (first_mask.unsqueeze(1) | second_mask.unsqueeze(2))
             attention_bias = torch.zeros(
                 (batch_size, seq_len, seq_len), dtype=features.dtype, device=features.device
             ).masked_fill(~allowed, torch.finfo(features.dtype).min)
@@ -346,19 +370,30 @@ class Gr00tN1d7ActionHead(nn.Module):
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
-        # Learned queries share every action-expert self/cross-attention operation,
-        # but intentionally receive no action position embedding.
+        # Learned queries receive no action position embedding.
         if self.config.use_third_view_aux_loss:
             query_features = self.learnable_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
         else:
             sa_embs = torch.cat((state_features, action_features), dim=1)
+        self_attention_mask = self._query_action_self_attention_mask(
+            sa_embs, state_features.shape[1]
+        )
         vl_attn_mask = backbone_output.backbone_attention_mask
+        gate_kwargs = {}
+        if self.config.use_action_query_gate:
+            gate_kwargs = dict(
+                query_token_range=(
+                    state_features.shape[1],
+                    state_features.shape[1] + self.config.num_learnable_queries,
+                ),
+                return_gate_stats=True,
+            )
 
         if self.config.use_alternate_vl_dit:
             image_mask = backbone_output.image_mask
             backbone_attention_mask = backbone_output.backbone_attention_mask
-            model_output, _ = self.model(
+            model_result = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
@@ -366,16 +401,22 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
+                self_attention_mask=self_attention_mask,
+                **gate_kwargs,
             )
         else:
-            model_output, _ = self.model(
+            model_result = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=vl_attn_mask,
                 timestep=t_discretized,
                 return_all_hidden_states=True,
+                self_attention_mask=self_attention_mask,
+                **gate_kwargs,
             )
 
+        model_output = model_result[0]
+        gate_stats = model_result[2] if self.config.use_action_query_gate else {}
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
 
@@ -399,14 +440,15 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         output = {
             "loss": loss,
+            "fm_loss": fm_loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
         if query_mse_loss is not None:
-            output["fm_loss"] = fm_loss
             output["query_mse_loss"] = query_mse_loss
+        output.update(gate_stats)
         return output
 
     def _encode_features(
@@ -539,8 +581,17 @@ class Gr00tN1d7ActionHead(nn.Module):
                 sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
             else:
                 sa_embs = torch.cat((state_features, action_features), dim=1)
+            self_attention_mask = self._query_action_self_attention_mask(
+                sa_embs, state_features.shape[1]
+            )
 
             # Run model forward.
+            gate_kwargs = {}
+            if self.config.use_action_query_gate:
+                gate_kwargs["query_token_range"] = (
+                    state_features.shape[1],
+                    state_features.shape[1] + self.config.num_learnable_queries,
+                )
             if self.config.use_alternate_vl_dit:
                 model_output = self.model(
                     hidden_states=sa_embs,
@@ -548,12 +599,16 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    self_attention_mask=self_attention_mask,
+                    **gate_kwargs,
                 )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    self_attention_mask=self_attention_mask,
+                    **gate_kwargs,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
