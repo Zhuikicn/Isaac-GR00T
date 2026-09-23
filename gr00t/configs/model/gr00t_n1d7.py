@@ -119,6 +119,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     # their exact architecture and behavior.
     use_third_view_aux_loss: bool = False
     mask_query_action_attention: bool = False
+    use_action_query_gate: bool = False
+    query_gate_init_prob: float = 0.5
     third_view_key: str = "third_view"
     num_learnable_queries: int = 112
     query_target_stage: str = "raw_cosmos"

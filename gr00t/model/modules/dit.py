@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+import math
 import os
 from typing import Optional
 
@@ -118,6 +119,8 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        use_action_query_gate: bool = False,
+        query_gate_init_prob: float = 0.5,
     ):
         super().__init__()
         self.dim = dim
@@ -131,6 +134,19 @@ class BasicTransformerBlock(nn.Module):
         self.positional_embeddings = positional_embeddings
         self.num_positional_embeddings = num_positional_embeddings
         self.norm_type = norm_type
+        self.action_query_gate = None
+        if use_action_query_gate:
+            if cross_attention_dim is not None:
+                raise ValueError("Action-query gates are only supported in self-attention blocks")
+            if not 0 < query_gate_init_prob < 1:
+                raise ValueError("Gate initial probability must be in (0, 1)")
+            self.query_gate_init_prob = query_gate_init_prob
+            self.action_query_gate = nn.Sequential(
+                nn.Linear(dim, 64),
+                nn.SiLU(),
+                nn.Linear(64, 1),
+            )
+            self.initialize_action_query_gate_parameters()
 
         if positional_embeddings and (num_positional_embeddings is None):
             raise ValueError(
@@ -177,6 +193,16 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.final_dropout = None
 
+    def initialize_action_query_gate_parameters(self) -> None:
+        """Also used after loading legacy checkpoints under HF no-init contexts."""
+        if self.action_query_gate is not None:
+            self.action_query_gate[0].reset_parameters()
+            nn.init.zeros_(self.action_query_gate[2].weight)
+            nn.init.constant_(
+                self.action_query_gate[2].bias,
+                math.log(self.query_gate_init_prob / (1 - self.query_gate_init_prob)),
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -184,12 +210,32 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
-    ) -> torch.Tensor:
+        query_token_range: tuple[int, int] | None = None,
+        return_gate_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, temb)
         else:
             norm_hidden_states = self.norm1(hidden_states)
+
+        gate_mean = None
+        if self.action_query_gate is not None:
+            if query_token_range is None:
+                raise ValueError("Action-query gating requires query_token_range")
+            query_start, query_end = query_token_range
+            batch_size, seq_len = hidden_states.shape[:2]
+            if not 0 <= query_start < query_end < seq_len:
+                raise ValueError("Expected state, nonempty query, then nonempty action tokens")
+            gate_logits = self.action_query_gate(norm_hidden_states[:, query_end:])
+            # Stable log(sigmoid(z)), with the same floor as log(clamp(g, min=1e-6)).
+            # Keep the model's mixed-precision policy and the full gradient path.
+            log_gate = F.logsigmoid(gate_logits).clamp_min(math.log(1e-6))
+            gate_bias = norm_hidden_states.new_zeros((batch_size, seq_len, seq_len))
+            gate_bias[:, query_end:, query_start:query_end] = log_gate.to(gate_bias.dtype)
+            attention_mask = gate_bias if attention_mask is None else attention_mask + gate_bias
+            if return_gate_stats:
+                gate_mean = gate_logits.detach().sigmoid().mean()
 
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
@@ -216,6 +262,8 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = ff_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
+        if return_gate_stats:
+            return hidden_states, gate_mean
         return hidden_states
 
 
@@ -243,12 +291,18 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        use_action_query_gate: bool = False,
+        query_gate_init_prob: float = 0.5,
     ):
         super().__init__()
 
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
+        if use_action_query_gate and (not interleave_self_attention or num_layers < 2):
+            raise ValueError(
+                "Action-query gating requires at least one interleaved self-attention block"
+            )
 
         # Timestep encoder
         self.timestep_encoder = TimestepEncoder(
@@ -276,6 +330,8 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    use_action_query_gate=use_action_query_gate and use_self_attn,
+                    query_gate_init_prob=query_gate_init_prob,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -289,6 +345,19 @@ class DiT(ModelMixin, ConfigMixin):
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
+    def initialize_action_query_gate_parameters(self) -> None:
+        for block in self.transformer_blocks:
+            block.initialize_action_query_gate_parameters()
+
+    @staticmethod
+    def _gate_stats(layer_means: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if layer_means:
+            return {
+                **layer_means,
+                "query_gate_mean": torch.stack(list(layer_means.values())).mean(),
+            }
+        return {}
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
@@ -297,7 +366,10 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
         self_attention_mask: Optional[torch.Tensor] = None,
+        query_token_range: tuple[int, int] | None = None,
+        return_gate_stats: bool = False,
     ):
+        """With return_gate_stats, append detached gate metrics to the usual outputs."""
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
 
@@ -306,6 +378,7 @@ class DiT(ModelMixin, ConfigMixin):
         encoder_hidden_states = encoder_hidden_states.contiguous()
 
         all_hidden_states = [hidden_states]
+        gate_means = {}
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
@@ -316,7 +389,13 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    query_token_range=query_token_range,
+                    return_gate_stats=return_gate_stats,
                 )
+                if return_gate_stats:
+                    hidden_states, gate_mean = hidden_states
+                    if gate_mean is not None:
+                        gate_means[f"query_gate_mean/layer_{idx}"] = gate_mean
             else:
                 hidden_states = block(
                     hidden_states,
@@ -331,10 +410,16 @@ class DiT(ModelMixin, ConfigMixin):
         conditioning = temb
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        output = self.proj_out_2(hidden_states)
+        if return_gate_stats:
+            stats = self._gate_stats(gate_means)
+            return (
+                (output, all_hidden_states, stats) if return_all_hidden_states else (output, stats)
+            )
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return output, all_hidden_states
         else:
-            return self.proj_out_2(hidden_states)
+            return output
 
 
 class AlternateVLDiT(DiT):
@@ -357,6 +442,8 @@ class AlternateVLDiT(DiT):
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
         self_attention_mask: Optional[torch.Tensor] = None,
+        query_token_range: tuple[int, int] | None = None,
+        return_gate_stats: bool = False,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -376,6 +463,7 @@ class AlternateVLDiT(DiT):
 
         all_hidden_states = [hidden_states]
         assert self.config.interleave_self_attention, "Interleave self attention must be enabled"
+        gate_means = {}
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
@@ -387,7 +475,13 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    query_token_range=query_token_range,
+                    return_gate_stats=return_gate_stats,
                 )
+                if return_gate_stats:
+                    hidden_states, gate_mean = hidden_states
+                    if gate_mean is not None:
+                        gate_means[f"query_gate_mean/layer_{idx}"] = gate_mean
             else:
                 # Cross-attention blocks - alternate between non-image and image tokens
                 if idx % (2 * self.attend_text_every_n_blocks) == 0:
@@ -410,10 +504,16 @@ class AlternateVLDiT(DiT):
         conditioning = temb
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        output = self.proj_out_2(hidden_states)
+        if return_gate_stats:
+            stats = self._gate_stats(gate_means)
+            return (
+                (output, all_hidden_states, stats) if return_all_hidden_states else (output, stats)
+            )
         if return_all_hidden_states:
-            return self.proj_out_2(hidden_states), all_hidden_states
+            return output, all_hidden_states
         else:
-            return self.proj_out_2(hidden_states)
+            return output
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):

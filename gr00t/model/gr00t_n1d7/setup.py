@@ -89,6 +89,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
                 mask_query_action_attention=self.config.model.mask_query_action_attention,
+                use_action_query_gate=self.config.model.use_action_query_gate,
+                query_gate_init_prob=self.config.model.query_gate_init_prob,
                 third_view_key=self.config.model.third_view_key,
                 num_learnable_queries=self.config.model.num_learnable_queries,
                 query_target_stage=self.config.model.query_target_stage,
@@ -131,17 +133,33 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.model.use_third_view_aux_loss
                 and actual_aux_missing == expected_legacy_aux_missing
             )
+            expected_gate_missing = {
+                name for name, _ in model.named_parameters() if ".action_query_gate." in name
+            }
+            actual_gate_missing = set(missing_keys) & expected_gate_missing
+            initialize_legacy_gate = (
+                self.config.model.use_action_query_gate
+                and bool(expected_gate_missing)
+                and actual_gate_missing == expected_gate_missing
+            )
             other_missing = [
                 k
                 for k in missing_keys
                 if "mask_token" not in k
                 and not (initialize_legacy_aux and k in expected_legacy_aux_missing)
+                and not (initialize_legacy_gate and k in expected_gate_missing)
             ]
             if initialize_legacy_aux:
                 model.action_head.initialize_third_view_aux_parameters()
                 logging.info(
                     "Third-view auxiliary parameters not in checkpoint; initialized: %s",
                     sorted(expected_legacy_aux_missing),
+                )
+            if initialize_legacy_gate:
+                model.action_head.model.initialize_action_query_gate_parameters()
+                logging.info(
+                    "Action-query gate parameters not in checkpoint; initialized: %s",
+                    sorted(expected_gate_missing),
                 )
             errors = []
             if other_missing:

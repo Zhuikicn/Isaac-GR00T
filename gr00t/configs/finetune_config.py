@@ -64,6 +64,12 @@ class FinetuneConfig:
     mask_query_action_attention: bool = False
     """Prevent learnable queries from attending to action tokens in DiT self-attention."""
 
+    use_action_query_gate: bool = False
+    """Gate action-to-query attention; requires third-view loss and unmasked query-to-action attention."""
+
+    query_gate_init_prob: float = 0.5
+    """Initial action-query gate probability, strictly between zero and one."""
+
     query_target_stage: str = "raw_cosmos"
     """Third-view target source: raw_cosmos or vl_postprocessor."""
 

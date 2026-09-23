@@ -190,3 +190,38 @@ When a run looks off, this table maps the common symptoms to causes that are ope
 | Good on `traj 0` but poor on held-out episodes | Expected with only 5 demo episodes — this is data scarcity, not a bug |
 
 > Establish this baseline on the **as-shipped** command before changing anything. Reproducing a known-good run first is the fastest way to separate setup mistakes from genuine issues when you scale to a larger dataset.
+
+## Optional: Action–Query Gating with Third-View Supervision
+
+For datasets already configured for the third-view auxiliary loss, append these
+arguments after the `--` separator of `examples/finetune.sh` (or pass them directly
+to `launch_finetune.py`):
+
+```bash
+--use-third-view-aux-loss \
+--use-action-query-gate \
+--no-mask-query-action-attention \
+--query-gate-init-prob 0.5
+```
+
+Each self-attention block predicts one gate per action token from its existing
+AdaLN output. The gate is shared across attention heads and adds
+`clamp_min(logsigmoid(logit), log(1e-6))` only to action-row/query-column logits.
+Queries can still attend to actions. Training keeps the existing flow-matching
+and third-view losses, so both objectives can influence the gates through the
+bidirectional interactions. Computation follows the existing mixed-precision
+policy; no explicit float32 conversion is added.
+
+Gating defaults to off. Enabling it requires third-view supervision, unmasked
+query-to-action attention, and interleaved self-attention. The gate MLP hidden
+width is fixed at 64. The initial probability is configurable; initialization
+only applies to new gate weights. Legacy checkpoints initialize missing gates,
+while saved gate weights are preserved on reload. Keep the gate flag when
+continuing fine-tuning a gated checkpoint; inference reads the gate settings
+from the saved model configuration.
+
+Training logs include `query_gate_mean` and `query_gate_mean/layer_<index>` for
+each self-attention block, using zero-based DiT block indices. These are gate
+probabilities, not measured attention shares. PyTorch inference recomputes gates
+at every flow step. The gate also leaves indirect query-to-state-to-action
+interactions intact.

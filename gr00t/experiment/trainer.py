@@ -294,9 +294,13 @@ class Gr00tTrainer(Trainer):
             aux_losses = {"fm_loss": outputs["fm_loss"].detach()}
             if "query_mse_loss" in outputs:
                 aux_losses["mse_loss"] = outputs["query_mse_loss"].detach()
+            aux_losses.update(
+                (name, value.detach())
+                for name, value in outputs.items()
+                if name == "query_gate_mean" or name.startswith("query_gate_mean/")
+            )
             aux_loss_means = {
-                name: self._nested_gather(value).mean().item()
-                for name, value in aux_losses.items()
+                name: self._nested_gather(value).mean().item() for name, value in aux_losses.items()
             }
             if self.args.local_rank in (-1, 0):
                 self.log(aux_loss_means)
