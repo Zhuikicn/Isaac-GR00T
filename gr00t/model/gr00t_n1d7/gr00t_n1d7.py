@@ -49,8 +49,6 @@ class Gr00tN1d7ActionHead(nn.Module):
         if config.use_action_query_gate:
             if not config.use_third_view_aux_loss:
                 raise ValueError("use_action_query_gate requires use_third_view_aux_loss=True")
-            if config.mask_query_action_attention:
-                raise ValueError("use_action_query_gate requires mask_query_action_attention=False")
             if config.num_learnable_queries <= 0:
                 raise ValueError("use_action_query_gate requires num_learnable_queries > 0")
 
@@ -152,16 +150,17 @@ class Gr00tN1d7ActionHead(nn.Module):
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
 
-    def _query_action_self_attention_mask(
+    def _third_view_self_attention_mask(
         self, hidden_states: torch.Tensor, num_state_tokens: int
     ) -> torch.Tensor | None:
-        """Mask action keys only for learnable-query rows in DiT self-attention."""
-        if not (self.config.use_third_view_aux_loss and self.config.mask_query_action_attention):
+        """Allow state -> state, queries -> state/queries, and actions -> all tokens."""
+        if not self.config.use_third_view_aux_loss:
             return None
 
         batch_size, seq_len = hidden_states.shape[:2]
         query_end = num_state_tokens + self.config.num_learnable_queries
         mask = hidden_states.new_zeros((batch_size, seq_len, seq_len))
+        mask[:, :num_state_tokens, num_state_tokens:] = torch.finfo(mask.dtype).min
         mask[:, num_state_tokens:query_end, query_end:] = torch.finfo(mask.dtype).min
         return mask
 
@@ -375,9 +374,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
         else:
             sa_embs = torch.cat((state_features, action_features), dim=1)
-        self_attention_mask = self._query_action_self_attention_mask(
-            sa_embs, state_features.shape[1]
-        )
+        self_attention_mask = self._third_view_self_attention_mask(sa_embs, state_features.shape[1])
         vl_attn_mask = backbone_output.backbone_attention_mask
         gate_kwargs = {}
         if self.config.use_action_query_gate:
@@ -580,7 +577,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
             else:
                 sa_embs = torch.cat((state_features, action_features), dim=1)
-            self_attention_mask = self._query_action_self_attention_mask(
+            self_attention_mask = self._third_view_self_attention_mask(
                 sa_embs, state_features.shape[1]
             )
 

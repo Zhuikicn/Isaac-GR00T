@@ -80,7 +80,6 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.use_third_view_aux_loss = ft_config.use_third_view_aux_loss
-    config.model.mask_query_action_attention = ft_config.mask_query_action_attention
     config.model.use_action_query_gate = ft_config.use_action_query_gate
     config.model.query_gate_init_prob = ft_config.query_gate_init_prob
     config.model.query_target_stage = ft_config.query_target_stage

@@ -117,8 +117,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Third-view representation auxiliary objective. This is intentionally
     # opt-in so checkpoints and processors created before this feature retain
     # their exact architecture and behavior.
+    # Enabling this also applies block self-attention: state -> state,
+    # queries -> state/queries, actions -> all tokens, in training and inference.
     use_third_view_aux_loss: bool = False
-    mask_query_action_attention: bool = False
     use_action_query_gate: bool = False
     query_gate_init_prob: float = 0.5
     third_view_key: str = "third_view"
