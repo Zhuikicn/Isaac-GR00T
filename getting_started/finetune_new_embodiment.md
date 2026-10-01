@@ -200,20 +200,28 @@ to `launch_finetune.py`):
 ```bash
 --use-third-view-aux-loss \
 --use-action-query-gate \
---no-mask-query-action-attention \
 --query-gate-init-prob 0.5
 ```
 
 Each self-attention block predicts one gate per action token from its existing
 AdaLN output. The gate is shared across attention heads and adds
 `clamp_min(logsigmoid(logit), log(1e-6))` only to action-row/query-column logits.
-Queries can still attend to actions. Training keeps the existing flow-matching
-and third-view losses, so both objectives can influence the gates through the
-bidirectional interactions. Computation follows the existing mixed-precision
-policy; no explicit float32 conversion is added.
+Enabling third-view supervision automatically applies block self-attention in
+both training and inference: state tokens attend only to state, learnable queries
+attend to state and queries, and action tokens attend to all three groups.
+Attention within each group is fully connected. Vision-language cross-attention
+is unchanged. The gate biases the allowed action-to-query attention; queries
+cannot read actions, including indirectly through state across layers. Training
+keeps the existing flow-matching and third-view losses; the flow-matching loss
+supervises the gates. Computation follows the existing mixed-precision policy;
+no explicit float32 conversion is added.
 
-Gating defaults to off. Enabling it requires third-view supervision, unmasked
-query-to-action attention, and interleaved self-attention. The gate MLP hidden
+The old mask flag has been removed. Remove `--mask-query-action-attention` or
+`--no-mask-query-action-attention` from existing launch commands. A residual
+`mask_query_action_attention` field in an old checkpoint does not affect behavior.
+
+Gating defaults to off. Enabling it requires third-view supervision and
+interleaved self-attention. The gate MLP hidden
 width is fixed at 64. The initial probability is configurable; initialization
 only applies to new gate weights. Legacy checkpoints initialize missing gates,
 while saved gate weights are preserved on reload. Keep the gate flag when

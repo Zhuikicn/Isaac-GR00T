@@ -92,7 +92,6 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
-                mask_query_action_attention=self.config.model.mask_query_action_attention,
                 use_action_query_gate=self.config.model.use_action_query_gate,
                 query_gate_init_prob=self.config.model.query_gate_init_prob,
                 third_view_key=self.config.model.third_view_key,

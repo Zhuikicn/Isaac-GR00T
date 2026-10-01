@@ -59,13 +59,10 @@ class FinetuneConfig:
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
     use_third_view_aux_loss: bool = False
-    """Enable learnable action-expert queries supervised by the third-view representation."""
-
-    mask_query_action_attention: bool = False
-    """Prevent learnable queries from attending to action tokens in DiT self-attention."""
+    """Enable third-view query supervision and block self-attention over state/queries/actions."""
 
     use_action_query_gate: bool = False
-    """Gate action-to-query attention; requires third-view loss and unmasked query-to-action attention."""
+    """Gate action-to-query attention; requires third-view loss and interleaved self-attention."""
 
     query_gate_init_prob: float = 0.5
     """Initial action-query gate probability, strictly between zero and one."""
