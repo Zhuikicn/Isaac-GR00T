@@ -284,7 +284,7 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # Log the distributed mean of the FM loss alongside the total training
-        # loss. When third-view supervision is enabled, log its MSE term too.
+        # loss. When third-view supervision is enabled, log its cosine term too.
         # Every Trainer reporter (including wandb) receives these metrics.
         if (
             model.training
@@ -292,8 +292,8 @@ class Gr00tTrainer(Trainer):
             and "fm_loss" in outputs
         ):
             aux_losses = {"fm_loss": outputs["fm_loss"].detach()}
-            if "query_mse_loss" in outputs:
-                aux_losses["mse_loss"] = outputs["query_mse_loss"].detach()
+            if "query_cosine_loss" in outputs:
+                aux_losses["query_cosine_loss"] = outputs["query_cosine_loss"].detach()
             aux_losses.update(
                 (name, value.detach())
                 for name, value in outputs.items()

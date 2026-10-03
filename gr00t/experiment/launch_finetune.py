@@ -120,11 +120,13 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.use_third_view_aux_loss = ft_config.use_third_view_aux_loss
+    config.model.num_learnable_queries = ft_config.num_learnable_queries
+    config.model.num_supervised_queries = ft_config.num_supervised_queries
     config.model.use_action_query_gate = ft_config.use_action_query_gate
     config.model.query_gate_init_prob = ft_config.query_gate_init_prob
     config.model.query_target_stage = ft_config.query_target_stage
     config.model.fm_loss_weight = ft_config.fm_loss_weight
-    config.model.query_mse_loss_weight = ft_config.query_mse_loss_weight
+    config.model.query_cosine_loss_weight = ft_config.query_cosine_loss_weight
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params

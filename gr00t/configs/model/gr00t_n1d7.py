@@ -123,10 +123,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_action_query_gate: bool = False
     query_gate_init_prob: float = 0.5
     third_view_key: str = "third_view"
-    num_learnable_queries: int = 112
+    num_learnable_queries: int = 8
+    num_supervised_queries: int = 4
     query_target_stage: str = "raw_cosmos"
     fm_loss_weight: float = 1.0
-    query_mse_loss_weight: float = 1.0
+    query_cosine_loss_weight: float = 1.0
     query_ffn_hidden_dim: int = 4096
 
     # State augmentation parameters

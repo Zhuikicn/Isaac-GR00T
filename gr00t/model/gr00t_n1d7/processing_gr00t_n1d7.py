@@ -164,7 +164,7 @@ class Gr00tN1d7DataCollator:
         model_type: str = "qwen",
         transformers_loading_kwargs: dict = {},
         use_third_view_aux_loss: bool = False,
-        num_learnable_queries: int = 112,
+        num_learnable_queries: int = 8,
     ):
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -202,12 +202,8 @@ class Gr00tN1d7DataCollator:
                     batch[k] = v
                 if self.use_third_view_aux_loss:
                     seq_len = vlm_inputs["input_ids"].shape[1]
-                    im_start_id = self.processor.tokenizer.convert_tokens_to_ids(
-                        "<|im_start|>"
-                    )
-                    image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
-                        "<|image_pad|>"
-                    )
+                    im_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+                    image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
                     first_user_end = []
                     third_view_token_mask = torch.zeros_like(
                         vlm_inputs["input_ids"], dtype=torch.bool
@@ -222,9 +218,8 @@ class Gr00tN1d7DataCollator:
                         if has_third:
                             positions = torch.arange(seq_len)
                             third_view_token_mask[row] = (
-                                (vlm_inputs["input_ids"][row] == image_token_id)
-                                & (positions >= boundary)
-                            )
+                                vlm_inputs["input_ids"][row] == image_token_id
+                            ) & (positions >= boundary)
                     batch["first_user_end"] = torch.tensor(first_user_end, dtype=torch.long)
                     batch["third_view_token_mask"] = third_view_token_mask
             elif key in (
@@ -278,7 +273,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         letter_box_transform: bool = False,
         use_third_view_aux_loss: bool = False,
         third_view_key: str = "third_view",
-        num_learnable_queries: int = 112,
+        num_learnable_queries: int = 8,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 

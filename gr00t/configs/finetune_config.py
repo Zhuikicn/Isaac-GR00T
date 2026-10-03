@@ -61,6 +61,12 @@ class FinetuneConfig:
     use_third_view_aux_loss: bool = False
     """Enable third-view query supervision and block self-attention over state/queries/actions."""
 
+    num_learnable_queries: int = 8
+    """Number of learnable DiT queries when third-view supervision is enabled."""
+
+    num_supervised_queries: int = 4
+    """Align this many trailing queries with trailing third-view tokens at the CA midpoint."""
+
     use_action_query_gate: bool = False
     """Gate action-to-query attention; requires third-view loss and interleaved self-attention."""
 
@@ -73,8 +79,8 @@ class FinetuneConfig:
     fm_loss_weight: float = 1.0
     """Alpha multiplier for the flow-matching loss."""
 
-    query_mse_loss_weight: float = 1.0
-    """Beta multiplier for the query-to-third-view MSE loss."""
+    query_cosine_loss_weight: float = 1.0
+    """Beta multiplier for the mean query-to-third-view (1 - cosine similarity) loss."""
 
     state_dropout_prob: float = 0.2
     """

@@ -110,12 +110,26 @@ class Gr00tN1d7ActionHead(nn.Module):
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         if config.use_third_view_aux_loss:
+            if not 1 <= config.num_supervised_queries <= config.num_learnable_queries:
+                raise ValueError("Expected 1 <= num_supervised_queries <= num_learnable_queries")
+            cross_attention_blocks = [
+                idx
+                for idx, block in enumerate(self.model.transformer_blocks)
+                if block.cross_attention_dim is not None
+            ]
+            if not cross_attention_blocks:
+                raise ValueError("Third-view supervision requires cross-attention blocks")
+            # all_hidden_states[0] is the input; subsequent entries are complete
+            # block outputs, including each block's FFN and both residuals.
+            self.query_supervision_hidden_index = (
+                cross_attention_blocks[(len(cross_attention_blocks) - 1) // 2] + 1
+            )
             self.learnable_queries = nn.Parameter(
                 torch.empty(config.num_learnable_queries, self.input_embedding_dim)
             )
             self.query_head = nn.Sequential(
-                nn.LayerNorm(self.hidden_size),
-                nn.Linear(self.hidden_size, config.query_ffn_hidden_dim),
+                nn.RMSNorm(self.model.inner_dim, eps=1e-6),
+                nn.Linear(self.model.inner_dim, config.query_ffn_hidden_dim),
                 nn.GELU(),
                 nn.Linear(config.query_ffn_hidden_dim, config.backbone_embedding_dim),
             )
@@ -295,12 +309,19 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.vlln.train(vlln_was_training)
                 self.vl_self_attention.train(vl_was_training)
 
-        batch_size = features.shape[0]
-        return features[third_mask].view(
-            batch_size,
-            self.config.num_learnable_queries,
-            self.config.backbone_embedding_dim,
-        )
+        # Select independently per sample: image-token counts can differ, and
+        # neither the target length nor padding is tied to the query count.
+        num_targets = self.config.num_supervised_queries
+        targets = []
+        for row in range(features.shape[0]):
+            positions = torch.nonzero(third_mask[row], as_tuple=False).flatten()
+            if positions.numel() < num_targets:
+                raise ValueError(
+                    f"Sample {row} has {positions.numel()} third-view image tokens; "
+                    f"need at least {num_targets} for query supervision"
+                )
+            targets.append(features[row, positions[-num_targets:]])
+        return torch.stack(targets)
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -334,6 +355,11 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
+        if self.config.use_third_view_aux_loss:
+            # Check all input state history steps; feature dropout below further
+            # excludes samples from query supervision.
+            query_supervision_mask = action_input.state.flatten(start_dim=1).ne(0).any(dim=1)
+
         # Handle state history
         assert action_input.state.shape[1] == self.config.state_history_length
         action_input.state = action_input.state.view(action_input.state.shape[0], 1, -1)
@@ -347,6 +373,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 torch.rand(state_features.shape[0], device=state_features.device)
                 < self.state_dropout_prob
             )
+            if self.config.use_third_view_aux_loss:
+                query_supervision_mask = query_supervision_mask & ~do_dropout
             do_dropout = do_dropout[:, None, None].to(dtype=state_features.dtype)
             state_features = state_features * (1 - do_dropout)
 
@@ -423,16 +451,30 @@ class Gr00tN1d7ActionHead(nn.Module):
         fm_loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
         if self.config.use_third_view_aux_loss:
-            query_output = model_output[:, 1 : 1 + self.config.num_learnable_queries]
+            query_end = state_features.shape[1] + self.config.num_learnable_queries
+            intermediate_output = model_result[1][self.query_supervision_hidden_index]
+            query_output = intermediate_output[
+                :, query_end - self.config.num_supervised_queries : query_end
+            ]
             query_prediction = self.query_head(query_output)
             query_target = self._third_view_target(full_backbone_output, action_input)
-            query_mse_loss = F.mse_loss(query_prediction, query_target, reduction="mean")
+            query_cosine_loss_per_sample = (
+                1
+                - F.cosine_similarity(
+                    query_prediction.float(), query_target.float(), dim=-1, eps=1e-8
+                )
+            ).mean(dim=-1)
+            # Average only over samples with a nonzero input state and no feature
+            # dropout. An all-excluded batch keeps a connected zero loss for backward/DDP.
+            query_cosine_loss = query_cosine_loss_per_sample.masked_fill(
+                ~query_supervision_mask, 0.0
+            ).sum() / query_supervision_mask.sum().clamp_min(1)
             loss = (
                 self.config.fm_loss_weight * fm_loss
-                + self.config.query_mse_loss_weight * query_mse_loss
+                + self.config.query_cosine_loss_weight * query_cosine_loss
             )
         else:
-            query_mse_loss = None
+            query_cosine_loss = None
             loss = fm_loss
 
         output = {
@@ -443,8 +485,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
-        if query_mse_loss is not None:
-            output["query_mse_loss"] = query_mse_loss
+        if query_cosine_loss is not None:
+            output["query_cosine_loss"] = query_cosine_loss
         output.update(gate_stats)
         return output
 

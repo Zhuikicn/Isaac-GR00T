@@ -191,7 +191,58 @@ When a run looks off, this table maps the common symptoms to causes that are ope
 
 > Establish this baseline on the **as-shipped** command before changing anything. Reproducing a known-good run first is the fastest way to separate setup mistakes from genuine issues when you scale to a larger dataset.
 
-## Optional: Action–Query Gating with Third-View Supervision
+## Optional: Midpoint Third-View Supervision and Action–Query Gating
+
+Third-view supervision uses 8 learnable DiT queries by default and directly
+supervises the last 4. The auxiliary branch reads the complete output of the
+middle cross-attention block (including its FFN and residuals): the
+`ceil(number_of_cross_attention_blocks / 2)`-th cross-attention block. With the
+official 32-block DiT, this is the 8th cross-attention block, overall block 15
+(counting from 1). All 8 queries continue through the remaining DiT blocks.
+
+The shared auxiliary head is `RMSNorm(1536, eps=1e-6) -> Linear(1536, 4096) ->
+GELU -> Linear(4096, 2048)` for the official model. RMSNorm has a learnable scale
+initialized to 1 and no bias. Its output is used only for supervision and is
+not written back into the DiT sequence. Input/output widths follow the model
+configuration.
+
+The last 4 queries are paired in order with the last 4 third-view image tokens
+for each sample, e.g. queries 5–8 with tokens 109–112 for a 112-token image.
+Targets default to `raw_cosmos`, the configured-depth VLM backbone output
+without VL postprocessing, and are detached. Token counts can differ between
+samples; fewer target tokens than the requested supervision count is an error.
+The loss is the mean of `1 - cosine_similarity` over pairs and samples,
+computed in FP32 with `eps=1e-8`, without pooling or negative samples.
+Samples whose input state is exactly zero across all dimensions and history
+steps, or whose encoded state features are dropped, are excluded from the cosine
+loss and its gradients. Eligibility requires both a nonzero input state and no
+feature dropout, using the actual per-sample dropout decision. The loss averages
+only over eligible samples, or is zero if none are eligible. Flow-matching loss
+still includes all samples according to the action mask.
+
+```bash
+--use-third-view-aux-loss \
+--num-learnable-queries 8 \
+--num-supervised-queries 4 \
+--query-target-stage raw_cosmos \
+--fm-loss-weight 1.0 \
+--query-cosine-loss-weight 1.0
+```
+
+The total loss is `fm_loss_weight * fm_loss + query_cosine_loss_weight *
+query_cosine_loss`; both weights default to 1. The new weight flag replaces
+`--query-mse-loss-weight`, and training logs report `query_cosine_loss`.
+The supervised count must be between 1 and the total query count. This setup
+starts a new experiment from the official base model, initializing queries
+and the auxiliary head; old auxiliary checkpoints are not migrated. New
+checkpoints save and restore the new configuration and auxiliary weights.
+
+The auxiliary loss backpropagates through the head and the DiT path up to the
+supervision point, without detaching intermediate queries. Earlier queries can
+receive indirect auxiliary gradients through query self-attention. Later DiT
+blocks and the final output projection receive no auxiliary-loss gradient;
+flow matching continues to train the full action path. Inference keeps all
+queries, skips the auxiliary head, and does not require third-view images.
 
 For datasets already configured for the third-view auxiliary loss, append these
 arguments after the `--` separator of `examples/finetune.sh` (or pass them directly
@@ -213,7 +264,7 @@ Attention within each group is fully connected. Vision-language cross-attention
 is unchanged. The gate biases the allowed action-to-query attention; queries
 cannot read actions, including indirectly through state across layers. Training
 keeps the existing flow-matching and third-view losses; the flow-matching loss
-supervises the gates. Computation follows the existing mixed-precision policy;
+supervises the gates. Gate computation follows the existing mixed-precision policy;
 no explicit float32 conversion is added.
 
 The old mask flag has been removed. Remove `--mask-query-action-attention` or
