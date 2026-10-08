@@ -16,6 +16,7 @@
 from copy import deepcopy
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import random
@@ -274,7 +275,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_third_view_aux_loss: bool = False,
         third_view_key: str = "third_view",
         num_learnable_queries: int = 8,
+        state_noise_std: float = 0.0,
     ):
+        if not math.isfinite(state_noise_std) or state_noise_std < 0:
+            raise ValueError(f"state_noise_std must be finite and >= 0, got {state_noise_std}")
         self.modality_configs = parse_modality_configs(modality_configs)
 
         # Initialize StateActionProcessor for state/action normalization
@@ -298,6 +302,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         # State augmentation settings
         self.exclude_state = exclude_state
         self.state_dropout_prob = state_dropout_prob
+        self.state_noise_std = state_noise_std
 
         self.letter_box_transform = letter_box_transform
 
@@ -711,6 +716,10 @@ class Gr00tN1d7Processor(BaseProcessor):
             normalized_states = torch.cat(
                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
             )
+            if self.training and self.state_noise_std > 0:
+                normalized_states = (
+                    normalized_states + self.state_noise_std * torch.randn_like(normalized_states)
+                ).clamp(-1.0, 1.0)
         normalized_states = torch.cat(
             [
                 normalized_states,
@@ -856,6 +865,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 # State augmentation
                 "exclude_state": self.exclude_state,
                 "state_dropout_prob": self.state_dropout_prob,
+                "state_noise_std": self.state_noise_std,
             },
         }
         with open(main_config_file, "w") as f:
@@ -926,6 +936,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        processor_kwargs.setdefault("state_noise_std", 0.0)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -939,6 +950,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "use_relative_action",
                 "exclude_state",
                 "state_dropout_prob",
+                "state_noise_std",
                 "use_mean_std",
                 "model_name",
                 "model_type",

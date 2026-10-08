@@ -15,6 +15,7 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+import math
 import warnings
 
 
@@ -86,6 +87,9 @@ class FinetuneConfig:
     """
     Dropout probability applied to state inputs for regularization during training.
     """
+
+    state_noise_std: float = 0.02
+    """Gaussian noise std on retained normalized states, clipped to [-1, 1]; 0 disables it."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
@@ -221,6 +225,8 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
+            raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

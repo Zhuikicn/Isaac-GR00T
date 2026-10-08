@@ -16,6 +16,7 @@
 from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
 from enum import Enum
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -132,6 +133,7 @@ class Gr00tN1d7Config(PretrainedConfig):
 
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
+    state_noise_std: float = 0.0  # Gaussian noise std on retained normalized state inputs
     exclude_state: bool = False  # Zero out all state inputs (ablation)
     use_mean_std: bool = False  # Use mean/std normalization instead of min/max
 
@@ -152,6 +154,9 @@ class Gr00tN1d7Config(PretrainedConfig):
                     setattr(self, f.name, f.default)
                 elif getattr(f, "default_factory", MISSING) is not MISSING:
                     setattr(self, f.name, f.default_factory())
+
+        if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
+            raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

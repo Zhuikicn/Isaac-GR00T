@@ -91,6 +91,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                state_noise_std=self.config.model.state_noise_std,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
                 use_action_query_gate=self.config.model.use_action_query_gate,
                 query_gate_init_prob=self.config.model.query_gate_init_prob,
@@ -237,6 +238,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # State augmentation overrides
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
+                state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
@@ -269,6 +271,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # State augmentation
                 exclude_state=self.model_config.exclude_state,
                 state_dropout_prob=self.model_config.state_dropout_prob,
+                state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
