@@ -72,6 +72,21 @@ class TimestepEncoder(nn.Module):
         return timesteps_emb
 
 
+def _apply_time_modulation(
+    hidden_states: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    unmodulated_prefix_length: int = 0,
+) -> torch.Tensor:
+    """Keep context tokens on plain LayerNorm; modulate only the action suffix."""
+    if unmodulated_prefix_length == 0:
+        return hidden_states * (1 + scale[:, None]) + shift[:, None]
+    context = hidden_states[:, :unmodulated_prefix_length]
+    actions = hidden_states[:, unmodulated_prefix_length:]
+    actions = actions * (1 + scale[:, None]) + shift[:, None]
+    return torch.cat((context, actions), dim=1)
+
+
 class AdaLayerNorm(nn.Module):
     def __init__(
         self,
@@ -91,11 +106,11 @@ class AdaLayerNorm(nn.Module):
         self,
         x: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
+        unmodulated_prefix_length: int = 0,
     ) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
         scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
-        return x
+        return _apply_time_modulation(self.norm(x), scale, shift, unmodulated_prefix_length)
 
 
 class BasicTransformerBlock(nn.Module):
@@ -212,10 +227,11 @@ class BasicTransformerBlock(nn.Module):
         temb: Optional[torch.LongTensor] = None,
         query_token_range: tuple[int, int] | None = None,
         return_gate_stats: bool = False,
+        unmodulated_prefix_length: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
-            norm_hidden_states = self.norm1(hidden_states, temb)
+            norm_hidden_states = self.norm1(hidden_states, temb, unmodulated_prefix_length)
         else:
             norm_hidden_states = self.norm1(hidden_states)
 
@@ -368,6 +384,7 @@ class DiT(ModelMixin, ConfigMixin):
         self_attention_mask: Optional[torch.Tensor] = None,
         query_token_range: tuple[int, int] | None = None,
         return_gate_stats: bool = False,
+        unmodulated_prefix_length: int = 0,
     ):
         """With return_gate_stats, append detached gate metrics to the usual outputs."""
         # Encode timesteps
@@ -389,6 +406,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    unmodulated_prefix_length=unmodulated_prefix_length,
                     query_token_range=query_token_range,
                     return_gate_stats=return_gate_stats,
                 )
@@ -403,13 +421,16 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    unmodulated_prefix_length=unmodulated_prefix_length,
                 )
             all_hidden_states.append(hidden_states)
 
         # Output processing
         conditioning = temb
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = _apply_time_modulation(
+            self.norm_out(hidden_states), scale, shift, unmodulated_prefix_length
+        )
         output = self.proj_out_2(hidden_states)
         if return_gate_stats:
             stats = self._gate_stats(gate_means)
@@ -444,6 +465,7 @@ class AlternateVLDiT(DiT):
         self_attention_mask: Optional[torch.Tensor] = None,
         query_token_range: tuple[int, int] | None = None,
         return_gate_stats: bool = False,
+        unmodulated_prefix_length: int = 0,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -475,6 +497,7 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    unmodulated_prefix_length=unmodulated_prefix_length,
                     query_token_range=query_token_range,
                     return_gate_stats=return_gate_stats,
                 )
@@ -497,13 +520,16 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
+                    unmodulated_prefix_length=unmodulated_prefix_length,
                 )
             all_hidden_states.append(hidden_states)
 
         # Output processing
         conditioning = temb
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = _apply_time_modulation(
+            self.norm_out(hidden_states), scale, shift, unmodulated_prefix_length
+        )
         output = self.proj_out_2(hidden_states)
         if return_gate_stats:
             stats = self._gate_stats(gate_means)

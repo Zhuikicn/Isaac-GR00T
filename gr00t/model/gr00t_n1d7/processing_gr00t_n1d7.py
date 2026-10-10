@@ -223,6 +223,12 @@ class Gr00tN1d7DataCollator:
                             ) & (positions >= boundary)
                     batch["first_user_end"] = torch.tensor(first_user_end, dtype=torch.long)
                     batch["third_view_token_mask"] = third_view_token_mask
+            elif key == "phase_labels":
+                if len(values) != len(features):
+                    raise ValueError(
+                        "Every sample in a phase training batch must have phase_labels"
+                    )
+                batch[key] = torch.from_numpy(np.stack(values)).long()
             elif key in (
                 "pixel_values",
                 "image_grid_thw",
@@ -276,6 +282,11 @@ class Gr00tN1d7Processor(BaseProcessor):
         third_view_key: str = "third_view",
         num_learnable_queries: int = 8,
         state_noise_std: float = 0.0,
+        use_phase_aux_loss: bool = False,
+        phase_label_key: str = "phase",
+        phase_num_classes: int = 3,
+        phase_mlp_hidden_dim: int = 1024,
+        phase_loss_weight: float = 1.0,
     ):
         if not math.isfinite(state_noise_std) or state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {state_noise_std}")
@@ -313,6 +324,13 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.use_third_view_aux_loss = use_third_view_aux_loss
         self.third_view_key = third_view_key
         self.num_learnable_queries = num_learnable_queries
+        if use_phase_aux_loss and use_third_view_aux_loss:
+            raise ValueError("Phase supervision is incompatible with third-view loss")
+        self.use_phase_aux_loss = use_phase_aux_loss
+        self.phase_label_key = phase_label_key
+        self.phase_num_classes = phase_num_classes
+        self.phase_mlp_hidden_dim = phase_mlp_hidden_dim
+        self.phase_loss_weight = phase_loss_weight
 
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
@@ -759,6 +777,18 @@ class Gr00tN1d7Processor(BaseProcessor):
         }
         if normalized_actions is not None:
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
+            if self.use_phase_aux_loss and (self.training or "phase_labels" in content.metadata):
+                if "phase_labels" not in content.metadata:
+                    raise ValueError("Phase training requires phase_labels in VLAStepData.metadata")
+                labels = np.asarray(content.metadata["phase_labels"])
+                if labels.shape != (action_horizon,) or not np.issubdtype(labels.dtype, np.integer):
+                    raise ValueError("phase_labels must contain one integer per action timestep")
+                valid = labels != -100
+                if ((labels[valid] < 0) | (labels[valid] >= self.phase_num_classes)).any():
+                    raise ValueError("phase_labels contains an out-of-range class ID")
+                padded_labels = np.full(self.max_action_horizon, -100, dtype=np.int64)
+                padded_labels[:action_horizon] = labels
+                transformed_inputs["phase_labels"] = padded_labels
         # Add VLM inputs
         transformed_inputs.update(vlm_inputs)
         if action_mask is not None:
@@ -852,6 +882,11 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "use_third_view_aux_loss": self.use_third_view_aux_loss,
                 "third_view_key": self.third_view_key,
                 "num_learnable_queries": self.num_learnable_queries,
+                "use_phase_aux_loss": self.use_phase_aux_loss,
+                "phase_label_key": self.phase_label_key,
+                "phase_num_classes": self.phase_num_classes,
+                "phase_mlp_hidden_dim": self.phase_mlp_hidden_dim,
+                "phase_loss_weight": self.phase_loss_weight,
                 # State action dimensions
                 "max_state_dim": self.max_state_dim,
                 "max_action_dim": self.max_action_dim,
@@ -960,6 +995,11 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "use_third_view_aux_loss",
                 "third_view_key",
                 "num_learnable_queries",
+                "use_phase_aux_loss",
+                "phase_label_key",
+                "phase_num_classes",
+                "phase_mlp_hidden_dim",
+                "phase_loss_weight",
             ]
             for key in override_keys:
                 if key in kwargs:

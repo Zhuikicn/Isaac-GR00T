@@ -131,6 +131,13 @@ class Gr00tN1d7Config(PretrainedConfig):
     query_cosine_loss_weight: float = 1.0
     query_ffn_hidden_dim: int = 4096
 
+    # Four time-independent context queries predict phases aligned with the action chunk.
+    use_phase_aux_loss: bool = False
+    phase_label_key: str = "phase"
+    phase_num_classes: int = 3
+    phase_mlp_hidden_dim: int = 1024
+    phase_loss_weight: float = 1.0
+
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
     state_noise_std: float = 0.0  # Gaussian noise std on retained normalized state inputs
@@ -157,6 +164,27 @@ class Gr00tN1d7Config(PretrainedConfig):
 
         if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
+        self.validate_phase_config()
+
+    def validate_phase_config(self) -> None:
+        if self.use_phase_aux_loss:
+            if self.use_third_view_aux_loss or self.use_action_query_gate:
+                raise ValueError(
+                    "Phase supervision is incompatible with third-view loss and query gates"
+                )
+            if (
+                not self.diffusion_model_cfg.get("interleave_self_attention", False)
+                or self.diffusion_model_cfg.get("num_layers", 0) < 2
+            ):
+                raise ValueError("Phase queries require at least two interleaved attention blocks")
+        if not isinstance(self.phase_num_classes, int) or self.phase_num_classes < 2:
+            raise ValueError("phase_num_classes must be an integer >= 2")
+        if not isinstance(self.phase_mlp_hidden_dim, int) or self.phase_mlp_hidden_dim < 1:
+            raise ValueError("phase_mlp_hidden_dim must be a positive integer")
+        if not self.phase_label_key:
+            raise ValueError("phase_label_key must not be empty")
+        if not math.isfinite(self.phase_loss_weight) or self.phase_loss_weight < 0:
+            raise ValueError("phase_loss_weight must be finite and >= 0")
 
     def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
         """Return a dictionary representation of this config, optionally excluding augmentation keys."""

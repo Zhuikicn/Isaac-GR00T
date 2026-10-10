@@ -46,6 +46,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
+        config.validate_phase_config()
 
         if config.use_action_query_gate:
             if not config.use_third_view_aux_loss:
@@ -135,6 +136,19 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             self.initialize_third_view_aux_parameters()
 
+        if config.use_phase_aux_loss:
+            self.phase_queries = nn.Parameter(torch.empty(4, self.input_embedding_dim))
+            self.phase_head = nn.Sequential(
+                nn.RMSNorm(self.model.inner_dim, eps=1e-6),
+                nn.Flatten(start_dim=1),
+                nn.Linear(4 * self.model.inner_dim, config.phase_mlp_hidden_dim),
+                nn.GELU(),
+                nn.Linear(
+                    config.phase_mlp_hidden_dim, self.action_horizon * config.phase_num_classes
+                ),
+            )
+            self.initialize_phase_aux_parameters()
+
         # State dropout parameters
         self.state_dropout_prob = config.state_dropout_prob
 
@@ -165,10 +179,55 @@ class Gr00tN1d7ActionHead(nn.Module):
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
 
-    def _third_view_self_attention_mask(
+    def initialize_phase_aux_parameters(self) -> None:
+        """Initialize the complete phase branch when loading a base checkpoint."""
+        nn.init.normal_(self.phase_queries, mean=0.0, std=0.02)
+        for module in self.phase_head.modules():
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
+    def _phase_outputs(self, query_states: torch.Tensor, action_input: BatchFeature) -> dict:
+        logits = self.phase_head(query_states).reshape(
+            query_states.shape[0], self.action_horizon, self.config.phase_num_classes
+        )
+        if "phase_labels" not in action_input:
+            raise ValueError("Phase supervision requires phase_labels for every training sample")
+        labels = action_input.phase_labels
+        if labels.dtype != torch.int64 or labels.shape != logits.shape[:2]:
+            raise ValueError("phase_labels must be int64 with shape [B, action_horizon]")
+        valid_labels = labels != -100
+        if (
+            (labels[valid_labels] < 0) | (labels[valid_labels] >= self.config.phase_num_classes)
+        ).any():
+            raise ValueError("phase_labels contains an out-of-range class ID")
+        valid = valid_labels & action_input.action_mask.bool().any(dim=-1)
+        targets = labels.masked_fill(~valid, -100)
+        frame_losses = F.cross_entropy(
+            logits.float().reshape(-1, self.config.phase_num_classes),
+            targets.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(labels)
+        count = valid.sum()
+        phase_loss = frame_losses.sum() / count.clamp_min(1)
+        accuracy = ((logits.argmax(dim=-1) == labels) & valid).sum().float() / count.clamp_min(1)
+        return {
+            "phase_logits": logits,
+            "phase_loss": phase_loss,
+            "phase_accuracy": accuracy.detach(),
+            "phase_valid_frames": count,
+        }
+
+    def _dit_self_attention_mask(
         self, hidden_states: torch.Tensor, num_state_tokens: int
     ) -> torch.Tensor | None:
-        """Allow state -> state, queries -> state/queries, and actions -> all tokens."""
+        """Restrict auxiliary context reads while allowing actions to read every token."""
+        if self.config.use_phase_aux_loss:
+            batch_size, seq_len = hidden_states.shape[:2]
+            context_end = num_state_tokens + 4
+            mask = hidden_states.new_zeros((batch_size, seq_len, seq_len))
+            mask[:, :context_end, context_end:] = -torch.inf
+            return mask
         if not self.config.use_third_view_aux_loss:
             return None
 
@@ -196,6 +255,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             if self.config.use_third_view_aux_loss:
                 self.learnable_queries.requires_grad_(False)
                 self.query_head.requires_grad_(False)
+            if self.config.use_phase_aux_loss:
+                self.phase_queries.requires_grad_(False)
+                self.phase_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         if not tune_vlln:
@@ -227,6 +289,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.position_embedding.eval()
                 if self.config.use_third_view_aux_loss:
                     self.query_head.eval()
+                if self.config.use_phase_aux_loss:
+                    self.phase_head.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
             if not self.tune_vlln:
@@ -401,13 +465,18 @@ class Gr00tN1d7ActionHead(nn.Module):
         if self.config.use_third_view_aux_loss:
             query_features = self.learnable_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+        elif self.config.use_phase_aux_loss:
+            query_features = self.phase_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
+            sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
         else:
             sa_embs = torch.cat((state_features, action_features), dim=1)
-        self_attention_mask = self._third_view_self_attention_mask(sa_embs, state_features.shape[1])
+        self_attention_mask = self._dit_self_attention_mask(sa_embs, state_features.shape[1])
         vl_attn_mask = backbone_output.backbone_attention_mask
-        gate_kwargs = {}
+        dit_kwargs = {}
+        if self.config.use_phase_aux_loss:
+            dit_kwargs["unmodulated_prefix_length"] = state_features.shape[1] + 4
         if self.config.use_action_query_gate:
-            gate_kwargs = dict(
+            dit_kwargs = dict(
                 query_token_range=(
                     state_features.shape[1],
                     state_features.shape[1] + self.config.num_learnable_queries,
@@ -427,7 +496,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
                 self_attention_mask=self_attention_mask,
-                **gate_kwargs,
+                **dit_kwargs,
             )
         else:
             model_result = self.model(
@@ -437,7 +506,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 timestep=t_discretized,
                 return_all_hidden_states=True,
                 self_attention_mask=self_attention_mask,
-                **gate_kwargs,
+                **dit_kwargs,
             )
 
         model_output = model_result[0]
@@ -477,6 +546,17 @@ class Gr00tN1d7ActionHead(nn.Module):
             query_cosine_loss = None
             loss = fm_loss
 
+        phase_outputs = {}
+        if self.config.use_phase_aux_loss:
+            # Last complete block, before the shared action output normalization/projection.
+            query_start = state_features.shape[1]
+            query_states = model_result[1][-1][:, query_start : query_start + 4]
+            phase_outputs = self._phase_outputs(query_states, action_input)
+            loss = (
+                self.config.fm_loss_weight * fm_loss
+                + self.config.phase_loss_weight * phase_outputs["phase_loss"]
+            )
+
         output = {
             "loss": loss,
             "fm_loss": fm_loss,
@@ -488,6 +568,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         if query_cosine_loss is not None:
             output["query_cosine_loss"] = query_cosine_loss
         output.update(gate_stats)
+        output.update(phase_outputs)
         return output
 
     def _encode_features(
@@ -618,16 +699,19 @@ class Gr00tN1d7ActionHead(nn.Module):
             if self.config.use_third_view_aux_loss:
                 query_features = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
                 sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+            elif self.config.use_phase_aux_loss:
+                query_features = self.phase_queries.unsqueeze(0).expand(batch_size, -1, -1)
+                sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
             else:
                 sa_embs = torch.cat((state_features, action_features), dim=1)
-            self_attention_mask = self._third_view_self_attention_mask(
-                sa_embs, state_features.shape[1]
-            )
+            self_attention_mask = self._dit_self_attention_mask(sa_embs, state_features.shape[1])
 
             # Run model forward.
-            gate_kwargs = {}
+            dit_kwargs = {}
+            if self.config.use_phase_aux_loss:
+                dit_kwargs["unmodulated_prefix_length"] = state_features.shape[1] + 4
             if self.config.use_action_query_gate:
-                gate_kwargs["query_token_range"] = (
+                dit_kwargs["query_token_range"] = (
                     state_features.shape[1],
                     state_features.shape[1] + self.config.num_learnable_queries,
                 )
@@ -639,7 +723,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                     self_attention_mask=self_attention_mask,
-                    **gate_kwargs,
+                    **dit_kwargs,
                 )
             else:
                 model_output = self.model(
@@ -647,7 +731,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                     self_attention_mask=self_attention_mask,
-                    **gate_kwargs,
+                    **dit_kwargs,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 

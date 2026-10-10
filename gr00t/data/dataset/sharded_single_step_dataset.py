@@ -30,6 +30,7 @@ def extract_step_data(
     modality_configs: dict[str, ModalityConfig],
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
+    use_phase_aux_loss: bool = False,
 ) -> VLAStepData:
     step_data = {}
 
@@ -76,6 +77,13 @@ def extract_step_data(
         text=text,
         embodiment=embodiment_tag,
     )
+    if use_phase_aux_loss:
+        # Compute validity BEFORE any action index clipping. Never repeat a terminal phase.
+        indices = np.asarray(modality_configs["action"].delta_indices) + step_index
+        valid = (indices >= 0) & (indices < len(episode_data))
+        labels = np.full(len(indices), -100, dtype=np.int64)
+        labels[valid] = episode_data["phase.label"].iloc[indices[valid]].to_numpy(dtype=np.int64)
+        vla_step_data.metadata["phase_labels"] = labels
     return vla_step_data
 
 
@@ -135,6 +143,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: float = 0.1,
         seed: int = 42,
         allow_padding: bool = False,
+        phase_label_key: str | None = None,
+        phase_num_classes: int = 3,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -144,6 +154,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        self.use_phase_aux_loss = phase_label_key is not None
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -152,6 +163,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_loader = LeRobotEpisodeLoader(
             dataset_path=dataset_path,
             modality_configs=modality_configs,
+            phase_label_key=phase_label_key,
+            phase_num_classes=phase_num_classes,
         )
 
         # Create balanced shards from episode timesteps
@@ -263,6 +276,7 @@ class ShardedSingleStepDataset(ShardedDataset):
             self.modality_configs,
             self.embodiment_tag,
             self.allow_padding,
+            self.use_phase_aux_loss,
         )
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]

@@ -102,6 +102,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 fm_loss_weight=self.config.model.fm_loss_weight,
                 query_cosine_loss_weight=self.config.model.query_cosine_loss_weight,
                 query_ffn_hidden_dim=self.config.model.query_ffn_hidden_dim,
+                use_phase_aux_loss=self.config.model.use_phase_aux_loss,
+                phase_label_key=self.config.model.phase_label_key,
+                phase_num_classes=self.config.model.phase_num_classes,
+                phase_mlp_hidden_dim=self.config.model.phase_mlp_hidden_dim,
+                phase_loss_weight=self.config.model.phase_loss_weight,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -146,12 +151,24 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and bool(expected_gate_missing)
                 and actual_gate_missing == expected_gate_missing
             )
+            expected_phase_missing = {
+                name
+                for name, _ in model.named_parameters()
+                if name == "action_head.phase_queries" or name.startswith("action_head.phase_head.")
+            }
+            actual_phase_missing = set(missing_keys) & expected_phase_missing
+            initialize_legacy_phase = (
+                self.config.model.use_phase_aux_loss
+                and bool(expected_phase_missing)
+                and actual_phase_missing == expected_phase_missing
+            )
             other_missing = [
                 k
                 for k in missing_keys
                 if "mask_token" not in k
                 and not (initialize_legacy_aux and k in expected_legacy_aux_missing)
                 and not (initialize_legacy_gate and k in expected_gate_missing)
+                and not (initialize_legacy_phase and k in expected_phase_missing)
             ]
             if initialize_legacy_aux:
                 model.action_head.initialize_third_view_aux_parameters()
@@ -164,6 +181,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info(
                     "Action-query gate parameters not in checkpoint; initialized: %s",
                     sorted(expected_gate_missing),
+                )
+            if initialize_legacy_phase:
+                model.action_head.initialize_phase_aux_parameters()
+                logging.info(
+                    "Phase auxiliary parameters not in checkpoint; initialized: %s",
+                    sorted(expected_phase_missing),
                 )
             errors = []
             if other_missing:
@@ -243,6 +266,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,
+                use_phase_aux_loss=self.model_config.use_phase_aux_loss,
+                phase_label_key=self.model_config.phase_label_key,
+                phase_num_classes=self.model_config.phase_num_classes,
+                phase_mlp_hidden_dim=self.model_config.phase_mlp_hidden_dim,
+                phase_loss_weight=self.model_config.phase_loss_weight,
                 **self.transformers_loading_kwargs,
             )
         else:
@@ -276,6 +304,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,
+                use_phase_aux_loss=self.model_config.use_phase_aux_loss,
+                phase_label_key=self.model_config.phase_label_key,
+                phase_num_classes=self.model_config.phase_num_classes,
+                phase_mlp_hidden_dim=self.model_config.phase_mlp_hidden_dim,
+                phase_loss_weight=self.model_config.phase_loss_weight,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 

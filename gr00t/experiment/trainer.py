@@ -294,6 +294,9 @@ class Gr00tTrainer(Trainer):
             aux_losses = {"fm_loss": outputs["fm_loss"].detach()}
             if "query_cosine_loss" in outputs:
                 aux_losses["query_cosine_loss"] = outputs["query_cosine_loss"].detach()
+            for name in ("phase_loss", "phase_accuracy", "phase_valid_frames"):
+                if name in outputs:
+                    aux_losses[name] = outputs[name].detach().float()
             aux_losses.update(
                 (name, value.detach())
                 for name, value in outputs.items()

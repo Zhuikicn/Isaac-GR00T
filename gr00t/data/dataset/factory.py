@@ -66,6 +66,12 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
+                    phase_label_key=(
+                        self.config.model.phase_label_key
+                        if getattr(self.config.model, "use_phase_aux_loss", False)
+                        else None
+                    ),
+                    phase_num_classes=getattr(self.config.model, "phase_num_classes", 3),
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])

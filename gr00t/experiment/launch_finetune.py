@@ -127,6 +127,12 @@ if __name__ == "__main__":
     config.model.query_target_stage = ft_config.query_target_stage
     config.model.fm_loss_weight = ft_config.fm_loss_weight
     config.model.query_cosine_loss_weight = ft_config.query_cosine_loss_weight
+    config.model.use_phase_aux_loss = ft_config.use_phase_aux_loss
+    config.model.phase_label_key = ft_config.phase_label_key
+    config.model.phase_num_classes = ft_config.phase_num_classes
+    config.model.phase_mlp_hidden_dim = ft_config.phase_mlp_hidden_dim
+    config.model.phase_loss_weight = ft_config.phase_loss_weight
+    config.model.validate_phase_config()
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.state_noise_std = ft_config.state_noise_std
     config.model.random_rotation_angle = ft_config.random_rotation_angle

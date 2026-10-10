@@ -83,6 +83,21 @@ class FinetuneConfig:
     query_cosine_loss_weight: float = 1.0
     """Beta multiplier for the mean query-to-third-view (1 - cosine similarity) loss."""
 
+    use_phase_aux_loss: bool = False
+    """Predict per-action-frame phases with four DiT queries; incompatible with third-view loss."""
+
+    phase_label_key: str = "phase"
+    """Integer phase label column in each episode parquet."""
+
+    phase_num_classes: int = 3
+    """Number of phase classes, using unchanged zero-based dataset IDs."""
+
+    phase_mlp_hidden_dim: int = 1024
+    """Hidden dimension of the MLP aggregating the four final-block queries."""
+
+    phase_loss_weight: float = 1.0
+    """Multiplier for valid-frame mean phase cross entropy."""
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.
@@ -225,6 +240,18 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if self.use_phase_aux_loss and (self.use_third_view_aux_loss or self.use_action_query_gate):
+            raise ValueError(
+                "Phase supervision is incompatible with third-view loss and query gates"
+            )
+        if not isinstance(self.phase_num_classes, int) or self.phase_num_classes < 2:
+            raise ValueError("phase_num_classes must be an integer >= 2")
+        if not isinstance(self.phase_mlp_hidden_dim, int) or self.phase_mlp_hidden_dim < 1:
+            raise ValueError("phase_mlp_hidden_dim must be a positive integer")
+        if not self.phase_label_key:
+            raise ValueError("phase_label_key must not be empty")
+        if not math.isfinite(self.phase_loss_weight) or self.phase_loss_weight < 0:
+            raise ValueError("phase_loss_weight must be finite and >= 0")
         if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
         if self.gradient_accumulation_steps < 1:

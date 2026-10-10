@@ -117,6 +117,8 @@ class LeRobotEpisodeLoader:
         dataset_path: str | Path,
         modality_configs: dict[str, ModalityConfig],
         decoder_kwargs: dict[str, Any] | None = None,
+        phase_label_key: str | None = None,
+        phase_num_classes: int = 3,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -128,6 +130,8 @@ class LeRobotEpisodeLoader:
         """
         self.dataset_path = Path(dataset_path)
         self.decoder_kwargs = decoder_kwargs
+        self.phase_label_key = phase_label_key
+        self.phase_num_classes = phase_num_classes
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -366,6 +370,20 @@ class LeRobotEpisodeLoader:
         parquet_path = self.dataset_path / parquet_filename
         original_df = pd.read_parquet(parquet_path)
         loaded_df = pd.DataFrame()
+
+        if self.phase_label_key is not None:
+            if self.phase_label_key not in original_df:
+                raise ValueError(f"Missing phase column {self.phase_label_key!r} in {parquet_path}")
+            labels = np.asarray(original_df[self.phase_label_key].tolist())
+            if labels.ndim == 2 and labels.shape[1] == 1:
+                labels = labels[:, 0]
+            if labels.ndim != 1 or not np.issubdtype(labels.dtype, np.integer):
+                raise ValueError(f"Phase labels must be non-null scalar integers in {parquet_path}")
+            if ((labels < 0) | (labels >= self.phase_num_classes)).any():
+                raise ValueError(
+                    f"Phase labels must be in [0, {self.phase_num_classes}) in {parquet_path}"
+                )
+            loaded_df["phase.label"] = labels.astype(np.int64)
 
         # Process language annotations (convert task indices to task strings)
         if "language" in self.modality_configs:

@@ -284,3 +284,135 @@ each self-attention block, using zero-based DiT block indices. These are gate
 probabilities, not measured attention shares. PyTorch inference recomputes gates
 at every flow step. The gate also leaves indirect query-to-state-to-action
 interactions intact.
+
+### Phase auxiliary prediction
+
+Enable this training objective with the following arguments after the `--`
+separator of `examples/finetune.sh`, or directly in `launch_finetune.py`:
+
+```bash
+--use-phase-aux-loss \
+--phase-label-key phase \
+--phase-num-classes 3 \
+--phase-mlp-hidden-dim 1024 \
+--fm-loss-weight 1.0 \
+--phase-loss-weight 1.0
+```
+
+Phase supervision is incompatible with `--use-third-view-aux-loss` and
+`--use-action-query-gate`, and requires interleaved self-attention. It defaults
+to off. Each episode parquet must contain the specified column, with one integer
+class ID per frame in `[0, phase_num_classes)`. Missing columns, null labels,
+non-integers, and out-of-range IDs are errors. IDs are preserved without remapping;
+phases may repeat or move backwards. Labels never enter the model's conditioning
+inputs or state/action normalization statistics.
+
+The branch adds exactly four learnable queries, initialized from `Normal(0, 0.02)`.
+Each DiT input is `[state tokens, four phase queries, action tokens]`. Self-attention
+allows state and phase queries to read each other, but neither group can read
+action tokens. Action tokens can read all three groups. In every block, state
+and phase queries use plain LayerNorm without timestep-dependent scale or shift;
+only action tokens retain AdaLN. The final DiT output normalization likewise
+applies time modulation only to action tokens. Vision-language cross-attention
+retains its existing behavior. Queries receive no action position embeddings.
+They restart from the learned vectors at each flow step; hidden states are not
+cached across steps. The third-view query count does not control phase queries.
+For fixed observations and state, with dropout disabled, the state/query hidden
+states and phase logits are independent of the flow timestep, sampled noise,
+and action trajectory. Training dropout and state augmentation can still vary
+these features. The attention restriction also blocks indirect action-to-query
+information flow through state tokens across layers.
+
+The head reads the four query states from the **last complete DiT block**, after
+its attention, FFN, and residuals, but before the final DiT normalization, time
+modulation, and output projection. Its architecture is:
+
+```text
+[B, 4, D] -> per-token shared RMSNorm(D, eps=1e-6) -> flatten [B, 4D]
+          -> Linear(4D, hidden) -> GELU -> Linear(hidden, H*C) -> [B, H, C]
+```
+
+RMSNorm starts with unit weights; Linear layers use PyTorch default initialization.
+The head adds no dropout. With `D=1536`, `hidden=1024`, `H=40`, and `C=3`, the
+queries and head add **6,423,160 parameters**. The output is raw logits, with
+position `h` aligned to the corresponding action delta index: the MY_G1 default
+is the current frame through `t+39`, not `t+1` through `t+40`.
+
+Sampling remains unchanged: an episode of length `N` contributes
+`max(0, N-H+1)` chunk starts for contiguous `0..H-1` action offsets. Starts with
+fewer than `H` remaining actions are excluded, including when `allow_padding`
+is enabled. The last complete chunk includes the terminal frame. Short input
+chunks are padded to the model horizon: action targets are zero-padded and their
+loss mask is zero, while phase labels are padded with `-100`. Phase validity is
+computed before index clipping, so an out-of-episode phase is ignored rather
+than copied from the terminal frame. Existing action index clipping is unchanged.
+
+Training reuses the same sampled flow time and noised actions as flow matching:
+`x_tau = (1-tau)*noise + tau*ground_truth_action`. At every sampled time, the
+head computes standard FP32 cross entropy on logits, without a preceding softmax,
+class weighting, label smoothing, temporal smoothing, or monotonicity constraints.
+Only valid labels at valid action time positions count. Cross entropy is summed
+over those frames and divided by their count; an all-invalid batch returns a
+connected zero loss. Zero input states and state dropout do not exclude samples.
+
+```text
+loss = fm_loss_weight * fm_loss + phase_loss_weight * phase_loss
+```
+
+Both weights default to 1. FM retains its existing valid-action-element mean;
+phase CE uses a valid-frame mean within each rank's current microbatch. Gradient
+accumulation and DDP retain the Trainer's behavior, including averaging gradients
+across ranks. A zero phase weight removes its contribution but still constructs
+the branch, computes its outputs, and requires valid training labels.
+
+Phase loss backpropagates through the head, queries, shared attention/FFN weights
+in all DiT blocks, and trainable state and visual-language encoders. It bypasses
+the action encoder, action position embeddings, timestep encoder, AdaLN time
+projections, final DiT output layers, and action decoder. FM still trains queries
+through action-to-context attention, and retains the action/time gradient paths. Setting
+`tune_projector=False` freezes queries and the head; `tune_diffusion_model=False`
+freezes DiT. Phase prediction now uses the current visual-language observations
+and state to predict the chunk's phases, without reading noised ground-truth
+actions at any flow time.
+
+Training outputs include `phase_logits`, `phase_loss`, `phase_accuracy`, and
+`phase_valid_frames`. Loss and accuracy logs are distributed rank means;
+`phase_valid_frames` logs the mean valid-frame count per rank/microbatch, not a
+global total. Accuracy uses the same mask as CE.
+
+Base checkpoints initialize the complete missing phase branch; phase checkpoints
+restore existing weights and saved configuration. Partial missing weights and
+third-view-to-phase checkpoint conversions are rejected by the training pipeline.
+When continuing fine-tuning, keep the phase flag and matching head settings in
+the launch command. Inference reads the saved configuration, retains all four
+queries, and skips the classifier. It needs neither phase labels nor third-view
+images and returns the usual action outputs without additional DiT calls.
+This context-only attention and normalization behavior applies whenever phase
+supervision is enabled. Earlier fully connected phase checkpoints retain compatible
+parameter shapes but use the new computation when loaded; this is an architecture
+change, not an exact continuation of their original forward behavior.
+
+Context-only phase smoke validation loaded all 537 official action-head tensors from
+the local GR00T-N1.7-3B checkpoint (32 DiT blocks). On an NVIDIA L40 with BF16,
+batch size 2, 40 action positions, and 96 synthetic backbone tokens:
+
+| Action-head mode | Forward peak allocated MiB | Forward + backward peak allocated MiB |
+| --- | ---: | ---: |
+| Base | 3377.88 | 6215.34 |
+| Phase auxiliary | 3460.48 | 6242.34 |
+| Increase | 82.60 | 27.00 |
+
+These are standalone action-head measurements using real checkpoint weights;
+they exclude backbone execution, optimizer state, and distributed training.
+With dropout disabled, changing flow time and noised actions produced exactly
+identical phase logits in the 32-block BF16 checkpoint (maximum difference 0).
+Both DiT implementations also passed layer-by-layer context invariance checks
+and gradient checks: phase CE has zero gradients into the action/time paths,
+while FM retains nonzero gradients into queries and the action/time paths.
+Temporary checks also verified phase gradient routing, zero-state/dropout
+supervision, masked CE, unchanged inference calls, checkpoint restoration, and
+all 20 labeled episodes (14,281 complete-chunk starts). No full fine-tuning run
+was started for this validation.
+
+For fine-tuning, use tmux and inject the proxy environment before launching;
+tmux does not automatically inherit those variables.
