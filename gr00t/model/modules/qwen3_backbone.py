@@ -19,6 +19,8 @@ from huggingface_hub.errors import GatedRepoError
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
+from gr00t.model.modules.third_delta import pooled_delta_target
+
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,10 @@ class Qwen3Backbone(torch.nn.Module):
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
+        use_third_view_aux_loss: bool = False,
+        third_delta_loss: bool = False,
+        third_delta_framework: str = "mlp",
+        third_delta_target: str = "visual_encoder",
         transformers_loading_kwargs: dict = {},
     ):
         """
@@ -162,6 +168,14 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+        self.use_third_view_aux_loss = use_third_view_aux_loss
+        self.third_delta_loss = third_delta_loss
+        if third_delta_loss and use_third_view_aux_loss:
+            raise ValueError("third_delta_loss is incompatible with third-view auxiliary loss")
+        if third_delta_target != "visual_encoder":
+            raise ValueError("third_delta_target currently supports only visual_encoder")
+        if third_delta_framework != "mlp":
+            raise ValueError("third_delta_framework currently supports only mlp")
 
         # Add attention kwargs
         extra_kwargs = {}
@@ -356,17 +370,80 @@ class Qwen3Backbone(torch.nn.Module):
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
-        # 0. Set frozen module to eval
+        third_mask = vl_input.get("third_view_token_mask")
+        delta_inputs = vl_input
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        outputs = outputs.hidden_states[-1]
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
+        visual_outputs = {}
+        handle = None
+        if self.use_third_view_aux_loss:
+            batch_size = image_mask.shape[0]
+            visual_dim = self.model.config.vision_config.out_hidden_size
+            visual_outputs = {
+                "third_view_visual_target": torch.zeros(
+                    batch_size, visual_dim, device=image_mask.device, dtype=torch.float32
+                ),
+                "third_view_visual_valid_mask": torch.zeros(
+                    batch_size, device=image_mask.device, dtype=torch.bool
+                ),
+            }
+            if third_mask is not None and third_mask.any():
+                # Qwen scatters the merger's main output into image placeholders
+                # in batch/sequence order. DeepStack outputs are not targets.
+                target_mask = third_mask.bool() & image_mask & attention_mask
+                selected = target_mask[image_mask]
+                sample_ids = image_mask.nonzero(as_tuple=True)[0][selected]
+                counts = target_mask.sum(dim=1)
+
+                def capture_visual_target(_module, _inputs, output):
+                    with torch.no_grad():
+                        features = output[0].detach().float()[selected]
+                        sums = features.new_zeros((batch_size, visual_dim))
+                        sums.index_add_(0, sample_ids, features)
+                        visual_outputs["third_view_visual_target"] = sums / counts.clamp_min(
+                            1
+                        ).unsqueeze(1)
+                        visual_outputs["third_view_visual_valid_mask"] = counts > 0
+
+                handle = self.model.visual.register_forward_hook(capture_visual_target)
+
+        if self.third_delta_loss:
+            layout = delta_inputs.get("third_delta_layout")
+            if layout is None:
+                raise ValueError("third_delta_loss requires CPU-prepared image alignment")
+            teacher_pixels = delta_inputs.get("third_delta_teacher_pixel_values")
+            teacher_grid = delta_inputs.get("third_delta_teacher_grid_thw")
+            if teacher_pixels is not None:
+                if teacher_grid is None or not layout["pairs"]:
+                    raise ValueError("Third-view pixels require grid and sample/time metadata")
+                with torch.no_grad():
+                    teacher_features = self.model.visual(
+                        teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
+                    )[0].detach()
+
+                def capture_delta_target(_module, _inputs, output):
+                    # A read-only hook: ego/second and DeepStack inputs stay original.
+                    visual_outputs["third_delta_target"] = pooled_delta_target(
+                        output[0].detach(), teacher_features, layout
+                    )
+
+                handle = self.model.visual.register_forward_hook(capture_delta_target)
+            elif self.training:
+                raise ValueError("third_delta_loss training requires third-view teacher images")
+
+        try:
+            outputs = self.model(**vl_input, output_hidden_states=True)
+        finally:
+            if handle is not None:
+                handle.remove()
+
         return BatchFeature(
             data={
-                "backbone_features": outputs,
+                "backbone_features": outputs.hidden_states[-1],
                 "backbone_attention_mask": attention_mask,
                 "image_mask": image_mask,
+                **visual_outputs,
             }
         )  # [B, T2, hidden_size]

@@ -92,15 +92,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 state_noise_std=self.config.model.state_noise_std,
+                third_delta_loss=self.config.model.third_delta_loss,
+                third_delta_framework=self.config.model.third_delta_framework,
+                third_delta_target=self.config.model.third_delta_target,
+                third_delta_loss_weight=self.config.model.third_delta_loss_weight,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
                 use_action_query_gate=self.config.model.use_action_query_gate,
                 query_gate_init_prob=self.config.model.query_gate_init_prob,
                 third_view_key=self.config.model.third_view_key,
                 num_learnable_queries=self.config.model.num_learnable_queries,
-                num_supervised_queries=self.config.model.num_supervised_queries,
-                query_target_stage=self.config.model.query_target_stage,
                 fm_loss_weight=self.config.model.fm_loss_weight,
-                query_cosine_loss_weight=self.config.model.query_cosine_loss_weight,
+                visual_loss_weight=self.config.model.visual_loss_weight,
                 query_ffn_hidden_dim=self.config.model.query_ffn_hidden_dim,
                 use_phase_aux_loss=self.config.model.use_phase_aux_loss,
                 phase_label_key=self.config.model.phase_label_key,
@@ -130,16 +132,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 "action_head.query_head.",
             )
             expected_legacy_aux_missing = {
-                "action_head.learnable_queries",
-                "action_head.query_head.0.weight",
-                "action_head.query_head.1.weight",
-                "action_head.query_head.1.bias",
-                "action_head.query_head.3.weight",
-                "action_head.query_head.3.bias",
+                name for name, _ in model.named_parameters() if name.startswith(aux_key_prefixes)
             }
             actual_aux_missing = {key for key in missing_keys if key.startswith(aux_key_prefixes)}
             initialize_legacy_aux = (
                 self.config.model.use_third_view_aux_loss
+                and bool(expected_legacy_aux_missing)
                 and actual_aux_missing == expected_legacy_aux_missing
             )
             expected_gate_missing = {
@@ -162,6 +160,18 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and bool(expected_phase_missing)
                 and actual_phase_missing == expected_phase_missing
             )
+            expected_delta_missing = {
+                name
+                for name, _ in model.named_parameters()
+                if name == "action_head.delta_queries"
+                or name.startswith("action_head.delta_query_head.")
+            }
+            actual_delta_missing = set(missing_keys) & expected_delta_missing
+            initialize_legacy_delta = (
+                self.config.model.third_delta_loss
+                and bool(expected_delta_missing)
+                and actual_delta_missing == expected_delta_missing
+            )
             other_missing = [
                 k
                 for k in missing_keys
@@ -169,6 +179,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and not (initialize_legacy_aux and k in expected_legacy_aux_missing)
                 and not (initialize_legacy_gate and k in expected_gate_missing)
                 and not (initialize_legacy_phase and k in expected_phase_missing)
+                and not (initialize_legacy_delta and k in expected_delta_missing)
             ]
             if initialize_legacy_aux:
                 model.action_head.initialize_third_view_aux_parameters()
@@ -187,6 +198,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 logging.info(
                     "Phase auxiliary parameters not in checkpoint; initialized: %s",
                     sorted(expected_phase_missing),
+                )
+            if initialize_legacy_delta:
+                model.action_head.initialize_third_delta_parameters()
+                logging.info(
+                    "Delta queries and MLP absent from base checkpoint; randomly initialized"
                 )
             errors = []
             if other_missing:
@@ -263,6 +279,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
+                third_delta_loss=self.model_config.third_delta_loss,
+                third_delta_framework=self.model_config.third_delta_framework,
+                third_delta_target=self.model_config.third_delta_target,
+                third_delta_loss_weight=self.model_config.third_delta_loss_weight,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,
@@ -301,6 +321,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
+                third_delta_loss=self.model_config.third_delta_loss,
+                third_delta_framework=self.model_config.third_delta_framework,
+                third_delta_target=self.model_config.third_delta_target,
+                third_delta_loss_weight=self.model_config.third_delta_loss_weight,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,

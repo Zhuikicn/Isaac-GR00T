@@ -38,6 +38,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
+from gr00t.model.modules.third_delta import DELTA_QUERY_COUNT, build_third_delta_layout
 
 from .image_augmentations import (
     apply_with_replay,
@@ -158,6 +159,40 @@ def validate_action_horizons(modality_configs, max_action_horizon: int) -> None:
         )
 
 
+def collate_third_delta_inputs(processor, contents: list[dict], batch: dict) -> None:
+    """Attach explicit image identities and a separate visual-only teacher batch."""
+    image_map, teacher_map, teacher_images = [], [], []
+    teacher_presence = []
+    for sample, content in enumerate(contents):
+        metadata = content.get("third_delta_image_metadata")
+        if metadata is None or len(metadata) != len(content["images"]):
+            raise ValueError("third_delta_loss requires metadata for every ego/second image")
+        image_map.extend((sample, time, view) for time, view in metadata)
+        images = content.get("third_delta_teacher_images", [])
+        times = content.get("third_delta_teacher_times", [])
+        if len(images) != len(times):
+            raise ValueError("Teacher images require matching observation time metadata")
+        teacher_presence.append(bool(images))
+        teacher_map.extend((sample, time) for time in times)
+        teacher_images.extend(images)
+    if any(teacher_presence) and not all(teacher_presence):
+        raise ValueError("A batch must provide teacher images for every sample or none")
+    teacher_grid = None
+    if teacher_images:
+        teacher = processor.image_processor(images=teacher_images, return_tensors="pt")
+        batch["third_delta_teacher_pixel_values"] = teacher["pixel_values"]
+        teacher_grid = teacher["image_grid_thw"]
+        batch["third_delta_teacher_grid_thw"] = teacher_grid
+    batch["third_delta_layout"] = build_third_delta_layout(
+        batch["image_grid_thw"],
+        image_map,
+        len(contents),
+        processor.image_processor.merge_size,
+        teacher_grid,
+        teacher_map,
+    )
+
+
 class Gr00tN1d7DataCollator:
     def __init__(
         self,
@@ -166,6 +201,7 @@ class Gr00tN1d7DataCollator:
         transformers_loading_kwargs: dict = {},
         use_third_view_aux_loss: bool = False,
         num_learnable_queries: int = 8,
+        third_delta_loss: bool = False,
     ):
         ### We need to use the same processor for padding input ids and concat
         self.processor = build_processor(model_name, transformers_loading_kwargs)
@@ -175,6 +211,7 @@ class Gr00tN1d7DataCollator:
         self.model_name = model_name
         self.use_third_view_aux_loss = use_third_view_aux_loss
         self.num_learnable_queries = num_learnable_queries
+        self.third_delta_loss = third_delta_loss
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
@@ -201,6 +238,8 @@ class Gr00tN1d7DataCollator:
                 )
                 for k, v in vlm_inputs.items():
                     batch[k] = v
+                if self.third_delta_loss:
+                    collate_third_delta_inputs(self.processor, values, batch)
                 if self.use_third_view_aux_loss:
                     seq_len = vlm_inputs["input_ids"].shape[1]
                     im_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
@@ -278,6 +317,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         # Normalization
         use_mean_std: bool = False,
         letter_box_transform: bool = False,
+        third_delta_loss: bool = False,
+        third_delta_framework: str = "mlp",
+        third_delta_target: str = "visual_encoder",
+        third_delta_loss_weight: float = 0.5,
         use_third_view_aux_loss: bool = False,
         third_view_key: str = "third_view",
         num_learnable_queries: int = 8,
@@ -321,6 +364,18 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.formalize_language = formalize_language
         self.model_name = model_name
         self.model_type = model_type
+        self.third_delta_loss = third_delta_loss
+        self.third_delta_framework = third_delta_framework
+        self.third_delta_target = third_delta_target
+        self.third_delta_loss_weight = third_delta_loss_weight
+        if third_delta_loss and (use_third_view_aux_loss or use_phase_aux_loss):
+            raise ValueError("third_delta_loss is incompatible with phase and third-view loss")
+        if third_delta_framework != "mlp" or third_delta_target != "visual_encoder":
+            raise ValueError("third_delta_loss currently supports mlp and visual_encoder only")
+        if not math.isfinite(third_delta_loss_weight) or third_delta_loss_weight < 0:
+            raise ValueError("third_delta_loss_weight must be finite and >= 0")
+        if third_delta_loss and num_learnable_queries != DELTA_QUERY_COUNT:
+            raise ValueError("DiT delta supervision requires exactly 8 queries")
         self.use_third_view_aux_loss = use_third_view_aux_loss
         self.third_view_key = third_view_key
         self.num_learnable_queries = num_learnable_queries
@@ -384,6 +439,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             model_type=model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
             use_third_view_aux_loss=use_third_view_aux_loss,
+            third_delta_loss=third_delta_loss,
             num_learnable_queries=num_learnable_queries,
         )
         self.train()
@@ -547,12 +603,22 @@ class Gr00tN1d7Processor(BaseProcessor):
         # third_view is a training-only auxiliary input and is never required
         # by the inference observation contract.
         image_keys = [key for key in image_keys if key != self.third_view_key]
+        if self.third_delta_loss:
+            if list(modality_config["video"].delta_indices) != [0]:
+                raise ValueError("DiT delta queries require video delta_indices=[0]")
+            if set(image_keys) != {"ego_view", "second_view"}:
+                raise ValueError("third_delta_loss inference requires ego_view and second_view")
+            image_keys = ["ego_view", "second_view"]
         images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
         images = torch.stack(
             [images_dict[view] for view in image_keys], dim=2
         )  # (B, T, V, H, W, C)
         assert images.ndim == 6
         B, T, V, img_H, img_W, img_C = images.shape
+        if self.third_delta_loss and T != 1:
+            raise ValueError(
+                "DiT delta queries require a single observation time: delta_indices=[0]"
+            )
 
         if self.use_albumentations:
             images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
@@ -574,15 +640,23 @@ class Gr00tN1d7Processor(BaseProcessor):
             for lang in observation[language_key]
         ]
 
-        texts, all_images = [], []
+        texts, all_images, contents = [], [], []
         for i in range(B):
             vlm_inputs = self._apply_vlm_processing(transformed_images[i], language[i])
             vc = vlm_inputs["vlm_content"]
+            if self.third_delta_loss:
+                vc["third_delta_image_metadata"] = [
+                    (time, view) for time in range(T) for view in (0, 1)
+                ]
+            contents.append(vc)
             texts.append(vc["text"])
             all_images.extend(vc["images"])
         tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True)
         for k, v in tokenized.items():
             transformed_observation[k] = v
+
+        if self.third_delta_loss:
+            collate_third_delta_inputs(self.processor, contents, transformed_observation)
 
         embodiment_id = (
             torch.ones(B, dtype=torch.int32) * self.embodiment_id_mapping[embodiment_tag.value]
@@ -755,7 +829,37 @@ class Gr00tN1d7Processor(BaseProcessor):
         else:
             image_transform = self.eval_image_transform
         image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
-        if not self.use_third_view_aux_loss or self.third_view_key not in content.images:
+        if self.third_delta_loss:
+            video_config = self.modality_configs[embodiment_tag.value]["video"]
+            if list(video_config.delta_indices) != [0]:
+                raise ValueError("DiT delta queries require video delta_indices=[0]")
+            required = {"ego_view", "second_view"}
+            if self.training:
+                required.add(self.third_view_key)
+                if not self.use_albumentations:
+                    raise ValueError(
+                        "third_delta_loss training requires synchronized Albumentations transforms"
+                    )
+                if content.masks is not None and getattr(image_transform, "mask_transforms", None):
+                    raise ValueError(
+                        "third_delta_loss does not support independently sampled mask transforms"
+                    )
+            if not required.issubset(image_keys) or not required.issubset(content.images):
+                raise ValueError(f"third_delta_loss requires views: {sorted(required)}")
+            if len(content.images["ego_view"]) != 1 or len(content.images["second_view"]) != 1:
+                raise ValueError("DiT delta queries require one ego/second image per sample")
+            image_keys = ["ego_view", "second_view"]
+            if self.third_view_key in content.images:
+                image_keys.append(self.third_view_key)
+            if len(content.images["ego_view"]) != len(content.images["second_view"]):
+                raise ValueError("ego/second observation times must match")
+            if self.third_view_key in content.images:
+                second, third = content.images["second_view"], content.images[self.third_view_key]
+                if len(second) != len(third) or any(
+                    np.asarray(a).shape != np.asarray(b).shape for a, b in zip(second, third)
+                ):
+                    raise ValueError("second/third frames must have matching times and dimensions")
+        elif not self.use_third_view_aux_loss or self.third_view_key not in content.images:
             image_keys = [key for key in image_keys if key != self.third_view_key]
 
         if self.formalize_language:
@@ -840,6 +944,23 @@ class Gr00tN1d7Processor(BaseProcessor):
             assert v.dtype == torch.uint8, f"{v} is not a uint8 tensor"
             assert v.shape[1] == 3, f"{v} is not a 3 channel tensor"
 
+        if self.third_delta_loss:
+            main_images = torch.stack(
+                [temporal_stacked_images[view] for view in ("ego_view", "second_view")], dim=1
+            ).flatten(0, 1)
+            vlm_inputs = self._apply_vlm_processing(main_images, language)
+            content = vlm_inputs["vlm_content"]
+            num_times = temporal_stacked_images["second_view"].shape[0]
+            content["third_delta_image_metadata"] = [
+                (time, view) for time in range(num_times) for view in (0, 1)
+            ]
+            if self.third_view_key in temporal_stacked_images:
+                content["third_delta_teacher_images"] = list(
+                    temporal_stacked_images[self.third_view_key]
+                )
+                content["third_delta_teacher_times"] = list(range(num_times))
+            return vlm_inputs
+
         if self.use_third_view_aux_loss and self.third_view_key in temporal_stacked_images:
             ego_keys = [view for view in image_keys if view != self.third_view_key]
             stacked_images = torch.stack(
@@ -879,6 +1000,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "model_name": self.model_name,
                 "model_type": self.model_type,
                 "formalize_language": self.formalize_language,
+                "third_delta_loss": self.third_delta_loss,
+                "third_delta_framework": self.third_delta_framework,
+                "third_delta_target": self.third_delta_target,
+                "third_delta_loss_weight": self.third_delta_loss_weight,
                 "use_third_view_aux_loss": self.use_third_view_aux_loss,
                 "third_view_key": self.third_view_key,
                 "num_learnable_queries": self.num_learnable_queries,
@@ -980,6 +1105,13 @@ class Gr00tN1d7Processor(BaseProcessor):
             for embodiment_tag, modality_config in modality_configs.items():
                 processor_kwargs["modality_configs"][embodiment_tag] = modality_config
             override_keys = [
+                "use_albumentations",
+                "image_crop_size",
+                "image_target_size",
+                "shortest_image_edge",
+                "crop_fraction",
+                "letter_box_transform",
+                "extra_augmentation_config",
                 "random_rotation_angle",
                 "color_jitter_params",
                 "use_relative_action",
@@ -992,6 +1124,10 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon",
                 "max_state_dim",
                 "max_action_dim",
+                "third_delta_loss",
+                "third_delta_framework",
+                "third_delta_target",
+                "third_delta_loss_weight",
                 "use_third_view_aux_loss",
                 "third_view_key",
                 "num_learnable_queries",

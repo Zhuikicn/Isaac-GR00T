@@ -115,9 +115,19 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
 
+    # Eight final DiT queries predict pooled third-minus-second merger features.
+    third_delta_loss: bool = False
+    # Serialized architecture marker; old input-compensation checkpoints used version 1.
+    third_delta_version: int = 2
+    # OmegaConf structured configs require str; allowed values are validated below.
+    third_delta_framework: str = "mlp"
+    third_delta_target: str = "visual_encoder"
+    third_delta_loss_weight: float = 0.5
+
     # Third-view representation auxiliary objective. This is intentionally
-    # opt-in so checkpoints and processors created before this feature retain
-    # their exact architecture and behavior.
+    # opt-in so models without auxiliary supervision keep their architecture.
+    # Pool all final DiT queries and align the MLP prediction with the detached
+    # mean third-view merger output (before the LLM), using cosine + SmoothL1.
     # Enabling this also applies block self-attention: state -> state,
     # queries -> state/queries, actions -> all tokens, in training and inference.
     use_third_view_aux_loss: bool = False
@@ -125,10 +135,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     query_gate_init_prob: float = 0.5
     third_view_key: str = "third_view"
     num_learnable_queries: int = 8
-    num_supervised_queries: int = 4
-    query_target_stage: str = "raw_cosmos"
     fm_loss_weight: float = 1.0
-    query_cosine_loss_weight: float = 1.0
+    visual_loss_weight: float = 0.1
     query_ffn_hidden_dim: int = 4096
 
     # Four time-independent context queries predict phases aligned with the action chunk.
@@ -167,6 +175,30 @@ class Gr00tN1d7Config(PretrainedConfig):
         self.validate_phase_config()
 
     def validate_phase_config(self) -> None:
+        if self.third_delta_loss and (
+            self.use_phase_aux_loss or self.use_third_view_aux_loss or self.use_action_query_gate
+        ):
+            raise ValueError(
+                "third_delta_loss is incompatible with phase, third-view loss and query gates"
+            )
+        if self.third_delta_framework != "mlp":
+            raise ValueError("third_delta_framework currently supports only mlp")
+        if self.third_delta_target != "visual_encoder":
+            raise ValueError("third_delta_target currently supports only visual_encoder")
+        if not math.isfinite(self.third_delta_loss_weight) or self.third_delta_loss_weight < 0:
+            raise ValueError("third_delta_loss_weight must be finite and >= 0")
+        if self.third_delta_loss:
+            if self.third_delta_version != 2:
+                raise ValueError("Only DiT delta-query architecture version 2 is supported")
+            if self.num_learnable_queries != 8 or self.query_ffn_hidden_dim != 4096:
+                raise ValueError(
+                    "DiT delta supervision requires 8 queries and MLP hidden width 4096"
+                )
+            if (
+                not self.diffusion_model_cfg.get("interleave_self_attention", False)
+                or self.diffusion_model_cfg.get("num_layers", 0) < 2
+            ):
+                raise ValueError("Delta queries require at least two interleaved attention blocks")
         if self.use_phase_aux_loss:
             if self.use_third_view_aux_loss or self.use_action_query_gate:
                 raise ValueError(
