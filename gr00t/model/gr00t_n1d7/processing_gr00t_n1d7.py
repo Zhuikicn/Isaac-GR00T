@@ -38,7 +38,6 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
-from gr00t.model.modules.third_delta import DELTA_QUERY_COUNT, build_third_delta_layout
 
 from .image_augmentations import (
     apply_with_replay,
@@ -177,20 +176,16 @@ def collate_third_delta_inputs(processor, contents: list[dict], batch: dict) -> 
         teacher_images.extend(images)
     if any(teacher_presence) and not all(teacher_presence):
         raise ValueError("A batch must provide teacher images for every sample or none")
-    teacher_grid = None
+    batch["third_delta_image_map"] = torch.tensor(image_map, dtype=torch.long).reshape(-1, 3)
+    if len(image_map) != batch["image_grid_thw"].shape[0]:
+        raise ValueError("Image metadata does not match the processed main image count")
     if teacher_images:
         teacher = processor.image_processor(images=teacher_images, return_tensors="pt")
         batch["third_delta_teacher_pixel_values"] = teacher["pixel_values"]
-        teacher_grid = teacher["image_grid_thw"]
-        batch["third_delta_teacher_grid_thw"] = teacher_grid
-    batch["third_delta_layout"] = build_third_delta_layout(
-        batch["image_grid_thw"],
-        image_map,
-        len(contents),
-        processor.image_processor.merge_size,
-        teacher_grid,
-        teacher_map,
-    )
+        batch["third_delta_teacher_grid_thw"] = teacher["image_grid_thw"]
+        batch["third_delta_teacher_map"] = torch.tensor(teacher_map, dtype=torch.long).reshape(
+            -1, 2
+        )
 
 
 class Gr00tN1d7DataCollator:
@@ -374,8 +369,6 @@ class Gr00tN1d7Processor(BaseProcessor):
             raise ValueError("third_delta_loss currently supports mlp and visual_encoder only")
         if not math.isfinite(third_delta_loss_weight) or third_delta_loss_weight < 0:
             raise ValueError("third_delta_loss_weight must be finite and >= 0")
-        if third_delta_loss and num_learnable_queries != DELTA_QUERY_COUNT:
-            raise ValueError("DiT delta supervision requires exactly 8 queries")
         self.use_third_view_aux_loss = use_third_view_aux_loss
         self.third_view_key = third_view_key
         self.num_learnable_queries = num_learnable_queries
@@ -604,8 +597,6 @@ class Gr00tN1d7Processor(BaseProcessor):
         # by the inference observation contract.
         image_keys = [key for key in image_keys if key != self.third_view_key]
         if self.third_delta_loss:
-            if list(modality_config["video"].delta_indices) != [0]:
-                raise ValueError("DiT delta queries require video delta_indices=[0]")
             if set(image_keys) != {"ego_view", "second_view"}:
                 raise ValueError("third_delta_loss inference requires ego_view and second_view")
             image_keys = ["ego_view", "second_view"]
@@ -615,10 +606,6 @@ class Gr00tN1d7Processor(BaseProcessor):
         )  # (B, T, V, H, W, C)
         assert images.ndim == 6
         B, T, V, img_H, img_W, img_C = images.shape
-        if self.third_delta_loss and T != 1:
-            raise ValueError(
-                "DiT delta queries require a single observation time: delta_indices=[0]"
-            )
 
         if self.use_albumentations:
             images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
@@ -830,9 +817,6 @@ class Gr00tN1d7Processor(BaseProcessor):
             image_transform = self.eval_image_transform
         image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
         if self.third_delta_loss:
-            video_config = self.modality_configs[embodiment_tag.value]["video"]
-            if list(video_config.delta_indices) != [0]:
-                raise ValueError("DiT delta queries require video delta_indices=[0]")
             required = {"ego_view", "second_view"}
             if self.training:
                 required.add(self.third_view_key)
@@ -846,8 +830,6 @@ class Gr00tN1d7Processor(BaseProcessor):
                     )
             if not required.issubset(image_keys) or not required.issubset(content.images):
                 raise ValueError(f"third_delta_loss requires views: {sorted(required)}")
-            if len(content.images["ego_view"]) != 1 or len(content.images["second_view"]) != 1:
-                raise ValueError("DiT delta queries require one ego/second image per sample")
             image_keys = ["ego_view", "second_view"]
             if self.third_view_key in content.images:
                 image_keys.append(self.third_view_key)
