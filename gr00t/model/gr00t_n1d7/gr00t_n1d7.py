@@ -31,7 +31,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
-from gr00t.model.modules.third_delta import validate_delta_checkpoint_config
+from gr00t.model.modules.third_delta import DELTA_QUERY_COUNT, validate_delta_checkpoint_config
 
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,17 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             self.initialize_phase_aux_parameters()
 
+        if config.third_delta_loss:
+            self.delta_queries = nn.Parameter(
+                torch.empty(DELTA_QUERY_COUNT, self.input_embedding_dim)
+            )
+            self.delta_query_head = nn.Sequential(
+                nn.Linear(self.model.config.output_dim, config.query_ffn_hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.query_ffn_hidden_dim, config.backbone_embedding_dim),
+            )
+            self.initialize_third_delta_parameters()
+
         # State dropout parameters
         self.state_dropout_prob = config.state_dropout_prob
 
@@ -164,6 +175,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         """Explicitly initialize parameters that are absent from legacy checkpoints."""
         nn.init.normal_(self.learnable_queries, mean=0.0, std=0.02)
         for module in self.query_head.modules():
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
+    def initialize_third_delta_parameters(self) -> None:
+        """Initialize all delta query parameters when absent from a base checkpoint."""
+        nn.init.normal_(self.delta_queries, mean=0.0, std=0.02)
+        for module in self.delta_query_head.modules():
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
 
@@ -210,6 +228,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         self, hidden_states: torch.Tensor, num_state_tokens: int
     ) -> torch.Tensor | None:
         """Restrict auxiliary context reads while allowing actions to read every token."""
+        if self.config.third_delta_loss:
+            # State, queries and actions all read each other bidirectionally.
+            return None
         if self.config.use_phase_aux_loss:
             batch_size, seq_len = hidden_states.shape[:2]
             context_end = num_state_tokens + 4
@@ -246,6 +267,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             if self.config.use_phase_aux_loss:
                 self.phase_queries.requires_grad_(False)
                 self.phase_head.requires_grad_(False)
+            if self.config.third_delta_loss:
+                self.delta_queries.requires_grad_(False)
+                self.delta_query_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         if not tune_vlln:
@@ -279,6 +303,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.query_head.eval()
                 if self.config.use_phase_aux_loss:
                     self.phase_head.eval()
+                if self.config.third_delta_loss:
+                    self.delta_query_head.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
             if not self.tune_vlln:
@@ -359,6 +385,27 @@ class Gr00tN1d7ActionHead(nn.Module):
             "visual_valid_samples": count,
         }
 
+    def _delta_outputs(
+        self, model_output: torch.Tensor, num_state_tokens: int, backbone_output: BatchFeature
+    ) -> dict:
+        if "third_delta_target" not in backbone_output:
+            raise ValueError("DiT delta supervision requires third-view teacher targets")
+        query_states = model_output[:, num_state_tokens : num_state_tokens + DELTA_QUERY_COUNT]
+        prediction = self.delta_query_head(query_states).float()
+        target = backbone_output.third_delta_target.detach().float()
+        if prediction.shape != target.shape:
+            raise ValueError("Delta query predictions and targets must have shape [B, 8, D]")
+        smooth_l1_loss = F.smooth_l1_loss(prediction, target, beta=1.0)
+        cosine = F.cosine_similarity(prediction, target, dim=-1, eps=1e-8).mean()
+        cosine_loss = 1 - cosine
+        return {
+            "third_delta_loss": smooth_l1_loss + 0.1 * cosine_loss,
+            "third_delta_smooth_l1_loss": smooth_l1_loss,
+            "third_delta_cosine_loss": cosine_loss,
+            "third_delta_cosine_similarity": cosine.detach(),
+            "third_delta_valid_groups": target.new_tensor(target.shape[0] * DELTA_QUERY_COUNT),
+        }
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
         Forward pass through the action head.
@@ -427,7 +474,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Learned queries receive no action position embedding.
-        if self.config.use_third_view_aux_loss:
+        if self.config.third_delta_loss:
+            query_features = self.delta_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
+            sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+        elif self.config.use_third_view_aux_loss:
             query_features = self.learnable_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
         elif self.config.use_phase_aux_loss:
@@ -496,6 +546,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         else:
             loss = fm_loss
 
+        delta_outputs = {}
+        if self.config.third_delta_loss:
+            delta_outputs = self._delta_outputs(
+                model_output, state_features.shape[1], full_backbone_output
+            )
+            loss = (
+                self.config.fm_loss_weight * fm_loss
+                + self.config.third_delta_loss_weight * delta_outputs["third_delta_loss"]
+            )
+
         phase_outputs = {}
         if self.config.use_phase_aux_loss:
             # Last complete block, before the shared action output normalization/projection.
@@ -518,6 +578,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         output.update(visual_outputs)
         output.update(gate_stats)
         output.update(phase_outputs)
+        output.update(delta_outputs)
         return output
 
     def _encode_features(
@@ -645,7 +706,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            if self.config.use_third_view_aux_loss:
+            if self.config.third_delta_loss:
+                query_features = self.delta_queries.unsqueeze(0).expand(batch_size, -1, -1)
+                sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
+            elif self.config.use_third_view_aux_loss:
                 query_features = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
                 sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
             elif self.config.use_phase_aux_loss:
@@ -768,7 +832,7 @@ class Gr00tN1d7(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Load original delta heads and reject incompatible DiT delta-query checkpoints."""
+        """Reject old delta checkpoints and initialize only a complete missing query branch."""
         config_kwargs = {
             key: kwargs[key]
             for key in (
@@ -789,24 +853,25 @@ class Gr00tN1d7(PreTrainedModel):
         model, loading_info = super().from_pretrained(
             pretrained_model_name_or_path, *model_args, output_loading_info=True, **kwargs
         )
-        query_delta_keys = [
+        old_delta_keys = [
             name
             for name in loading_info.get("unexpected_keys", [])
-            if name.startswith(("action_head.delta_queries", "action_head.delta_query_head."))
+            if name.startswith("backbone.third_delta_head.")
         ]
-        if query_delta_keys:
+        if old_delta_keys:
             raise RuntimeError(
-                "DiT delta-query weights cannot load into the LLM-input delta compensation model"
+                "Old LLM-input delta compensation weights cannot load into DiT delta queries"
             )
         if checkpoint_config.get("third_delta_loss") and not model.config.third_delta_loss:
             raise RuntimeError(
-                "Cannot disable delta compensation when loading a delta compensation checkpoint"
+                "Cannot disable DiT delta queries when loading a delta-query checkpoint"
             )
         if model.config.third_delta_loss:
             delta_keys = {
                 name
                 for name, _ in model.named_parameters()
-                if name.startswith("backbone.third_delta_head.")
+                if name == "action_head.delta_queries"
+                or name.startswith("action_head.delta_query_head.")
             }
             missing = set(loading_info.get("missing_keys", [])) & delta_keys
             mismatched = [
@@ -818,11 +883,13 @@ class Gr00tN1d7(PreTrainedModel):
                 missing and (missing != delta_keys or checkpoint_config.get("third_delta_loss"))
             ):
                 raise RuntimeError(
-                    "Delta compensation checkpoint has partially missing or mismatched parameters"
+                    "Delta query checkpoint has partially missing or mismatched parameters"
                 )
             if missing:
-                model.backbone.initialize_third_delta_parameters()
-                logger.info("Third delta head absent from base checkpoint; randomly initialized")
+                model.action_head.initialize_third_delta_parameters()
+                logger.info(
+                    "Delta queries and MLP absent from base checkpoint; randomly initialized"
+                )
                 # These parameters were explicitly initialized; pipeline strict checks
                 # must still reject every other missing or mismatched checkpoint key.
                 loading_info["missing_keys"] = [
@@ -933,20 +1000,6 @@ class Gr00tN1d7(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_outputs = self.action_head(backbone_outputs, action_inputs)
-        if self.config.third_delta_loss:
-            if "third_delta_loss" not in backbone_outputs:
-                raise ValueError("Supervised forward requires third-view teacher images")
-            action_outputs["loss"] = (
-                self.config.fm_loss_weight * action_outputs["fm_loss"]
-                + self.config.third_delta_loss_weight * backbone_outputs["third_delta_loss"]
-            )
-            action_outputs.update(
-                {
-                    key: value
-                    for key, value in backbone_outputs.items()
-                    if key.startswith("third_delta_")
-                }
-            )
         return action_outputs
 
     def get_action(self, inputs: dict, options: dict[str, Any] | None = None) -> BatchFeature:

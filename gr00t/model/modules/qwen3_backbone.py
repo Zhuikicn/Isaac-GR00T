@@ -19,7 +19,7 @@ from huggingface_hub.errors import GatedRepoError
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
-from gr00t.model.modules.third_delta import build_third_delta_head, compensate_visual_tokens
+from gr00t.model.modules.third_delta import pooled_delta_target
 
 
 logger = logging.getLogger(__name__)
@@ -223,10 +223,6 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
-        if third_delta_loss:
-            self.third_delta_head = build_third_delta_head(
-                third_delta_framework, self.model.config.vision_config.out_hidden_size
-            )
 
     def _apply_vision_patch_embed_channels_last(self) -> None:
         """Force the Qwen3-VL vision patch-embed ``Conv3d`` to ``channels_last_3d``.
@@ -372,12 +368,6 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
-    def initialize_third_delta_parameters(self) -> None:
-        if self.third_delta_loss:
-            for module in self.third_delta_head.modules():
-                if isinstance(module, torch.nn.Linear):
-                    module.reset_parameters()
-
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         third_mask = vl_input.get("third_view_token_mask")
@@ -420,40 +410,28 @@ class Qwen3Backbone(torch.nn.Module):
                 handle = self.model.visual.register_forward_hook(capture_visual_target)
 
         if self.third_delta_loss:
-            image_map = delta_inputs.get("third_delta_image_map")
-            if image_map is None:
-                raise ValueError("third_delta_loss requires explicit ego/second image metadata")
+            layout = delta_inputs.get("third_delta_layout")
+            if layout is None:
+                raise ValueError("third_delta_loss requires CPU-prepared image alignment")
             teacher_pixels = delta_inputs.get("third_delta_teacher_pixel_values")
             teacher_grid = delta_inputs.get("third_delta_teacher_grid_thw")
-            teacher_map = delta_inputs.get("third_delta_teacher_map")
-            teacher_features = None
             if teacher_pixels is not None:
-                if teacher_grid is None or teacher_map is None:
+                if teacher_grid is None or not layout["pairs"]:
                     raise ValueError("Third-view pixels require grid and sample/time metadata")
                 with torch.no_grad():
                     teacher_features = self.model.visual(
                         teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
                     )[0].detach()
 
+                def capture_delta_target(_module, _inputs, output):
+                    # A read-only hook: ego/second and DeepStack inputs stay original.
+                    visual_outputs["third_delta_target"] = pooled_delta_target(
+                        output[0].detach(), teacher_features, layout
+                    )
+
+                handle = self.model.visual.register_forward_hook(capture_delta_target)
             elif self.training:
                 raise ValueError("third_delta_loss training requires third-view teacher images")
-
-            def compensate_main_visual(_module, _inputs, output):
-                main, metrics = compensate_visual_tokens(
-                    output[0],
-                    vl_input["image_grid_thw"],
-                    image_map,
-                    self.third_delta_head,
-                    self.model.config.vision_config.spatial_merge_size,
-                    teacher_features,
-                    teacher_grid,
-                    teacher_map,
-                )
-                visual_outputs.update(metrics)
-                # Ego features and Qwen3-VL DeepStack features are unchanged.
-                return (main, *output[1:])
-
-            handle = self.model.visual.register_forward_hook(compensate_main_visual)
 
         try:
             outputs = self.model(**vl_input, output_hidden_states=True)

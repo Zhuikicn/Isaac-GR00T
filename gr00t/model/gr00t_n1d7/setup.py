@@ -93,7 +93,6 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 state_noise_std=self.config.model.state_noise_std,
                 third_delta_loss=self.config.model.third_delta_loss,
-                third_delta_version=self.config.model.third_delta_version,
                 third_delta_framework=self.config.model.third_delta_framework,
                 third_delta_target=self.config.model.third_delta_target,
                 third_delta_loss_weight=self.config.model.third_delta_loss_weight,
@@ -164,7 +163,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             expected_delta_missing = {
                 name
                 for name, _ in model.named_parameters()
-                if name.startswith("backbone.third_delta_head.")
+                if name == "action_head.delta_queries"
+                or name.startswith("action_head.delta_query_head.")
             }
             actual_delta_missing = set(missing_keys) & expected_delta_missing
             initialize_legacy_delta = (
@@ -200,8 +200,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     sorted(expected_phase_missing),
                 )
             if initialize_legacy_delta:
-                model.backbone.initialize_third_delta_parameters()
-                logging.info("Third delta head absent from base checkpoint; randomly initialized")
+                model.action_head.initialize_third_delta_parameters()
+                logging.info(
+                    "Delta queries and MLP absent from base checkpoint; randomly initialized"
+                )
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
