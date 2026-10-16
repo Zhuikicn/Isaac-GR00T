@@ -19,7 +19,11 @@ from huggingface_hub.errors import GatedRepoError
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
-from gr00t.model.modules.third_delta import pooled_delta_target
+from gr00t.model.modules.third_delta import (
+    build_third_head,
+    compensate_visual_tokens,
+    pooled_third_target,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -148,9 +152,10 @@ class Qwen3Backbone(torch.nn.Module):
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
         use_third_view_aux_loss: bool = False,
-        third_delta_loss: bool = False,
-        third_delta_framework: str = "mlp",
-        third_delta_target: str = "visual_encoder",
+        third_loss: bool = False,
+        third_framework: str = "mlp",
+        third_target: str = "visual_encoder",
+        third_prediction_target: str = "third",
         transformers_loading_kwargs: dict = {},
     ):
         """
@@ -169,13 +174,17 @@ class Qwen3Backbone(torch.nn.Module):
 
         super().__init__()
         self.use_third_view_aux_loss = use_third_view_aux_loss
-        self.third_delta_loss = third_delta_loss
-        if third_delta_loss and use_third_view_aux_loss:
-            raise ValueError("third_delta_loss is incompatible with third-view auxiliary loss")
-        if third_delta_target != "visual_encoder":
-            raise ValueError("third_delta_target currently supports only visual_encoder")
-        if third_delta_framework != "mlp":
-            raise ValueError("third_delta_framework currently supports only mlp")
+        self.third_loss = third_loss
+        self.third_framework = third_framework
+        self.third_prediction_target = third_prediction_target
+        if third_loss and use_third_view_aux_loss:
+            raise ValueError("third_loss is incompatible with third-view auxiliary loss")
+        if third_target != "visual_encoder":
+            raise ValueError("third_target currently supports only visual_encoder")
+        if third_framework not in ("mlp", "transformer", "queries"):
+            raise ValueError("third_framework must be mlp, transformer or queries")
+        if third_prediction_target not in ("third", "delta"):
+            raise ValueError("third_prediction_target must be third or delta")
 
         # Add attention kwargs
         extra_kwargs = {}
@@ -223,6 +232,10 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
+        if third_loss and third_framework in ("mlp", "transformer"):
+            self.third_head = build_third_head(
+                third_framework, self.model.config.vision_config.out_hidden_size
+            )
 
     def _apply_vision_patch_embed_channels_last(self) -> None:
         """Force the Qwen3-VL vision patch-embed ``Conv3d`` to ``channels_last_3d``.
@@ -365,13 +378,21 @@ class Qwen3Backbone(torch.nn.Module):
             )
         return changed
 
+    def initialize_third_parameters(self) -> None:
+        if self.third_loss and self.third_framework == "transformer":
+            self.third_head.reset_parameters()
+        elif self.third_loss and self.third_framework == "mlp":
+            for module in self.third_head.modules():
+                if isinstance(module, torch.nn.Linear):
+                    module.reset_parameters()
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         third_mask = vl_input.get("third_view_token_mask")
-        delta_inputs = vl_input
+        third_inputs = vl_input
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
@@ -409,12 +430,50 @@ class Qwen3Backbone(torch.nn.Module):
 
                 handle = self.model.visual.register_forward_hook(capture_visual_target)
 
-        if self.third_delta_loss:
-            layout = delta_inputs.get("third_delta_layout")
+        if self.third_loss and self.third_framework in ("mlp", "transformer"):
+            image_map = third_inputs.get("third_image_map")
+            if image_map is None:
+                raise ValueError("third_loss requires explicit ego/second image metadata")
+            teacher_pixels = third_inputs.get("third_teacher_pixel_values")
+            teacher_grid = third_inputs.get("third_teacher_grid_thw")
+            teacher_map = third_inputs.get("third_teacher_map")
+            teacher_features = None
+            if teacher_pixels is not None:
+                if teacher_grid is None or teacher_map is None:
+                    raise ValueError("Third-view pixels require grid and sample/time metadata")
+                with torch.no_grad():
+                    teacher_features = self.model.visual(
+                        teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
+                    )[0].detach()
+
+            elif self.training:
+                raise ValueError("third_loss training requires third-view teacher images")
+
+            def compensate_main_visual(_module, _inputs, output):
+                main, metrics = compensate_visual_tokens(
+                    output[0],
+                    vl_input["image_grid_thw"],
+                    image_map,
+                    self.third_head,
+                    self.model.config.vision_config.spatial_merge_size,
+                    teacher_features,
+                    teacher_grid,
+                    teacher_map,
+                    framework=self.third_framework,
+                    prediction_target=self.third_prediction_target,
+                )
+                visual_outputs.update(metrics)
+                # Ego features and Qwen3-VL DeepStack features are unchanged.
+                return (main, *output[1:])
+
+            handle = self.model.visual.register_forward_hook(compensate_main_visual)
+
+        elif self.third_loss:
+            layout = third_inputs.get("third_layout")
             if layout is None:
-                raise ValueError("third_delta_loss requires CPU-prepared image alignment")
-            teacher_pixels = delta_inputs.get("third_delta_teacher_pixel_values")
-            teacher_grid = delta_inputs.get("third_delta_teacher_grid_thw")
+                raise ValueError("third_loss requires CPU-prepared image alignment")
+            teacher_pixels = third_inputs.get("third_teacher_pixel_values")
+            teacher_grid = third_inputs.get("third_teacher_grid_thw")
             if teacher_pixels is not None:
                 if teacher_grid is None or not layout["pairs"]:
                     raise ValueError("Third-view pixels require grid and sample/time metadata")
@@ -423,15 +482,20 @@ class Qwen3Backbone(torch.nn.Module):
                         teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
                     )[0].detach()
 
-                def capture_delta_target(_module, _inputs, output):
+                def capture_third_target(_module, _inputs, output):
                     # A read-only hook: ego/second and DeepStack inputs stay original.
-                    visual_outputs["third_delta_target"] = pooled_delta_target(
-                        output[0].detach(), teacher_features, layout
+                    visual_outputs.update(
+                        pooled_third_target(
+                            output[0].detach(),
+                            teacher_features,
+                            layout,
+                            self.third_prediction_target,
+                        )
                     )
 
-                handle = self.model.visual.register_forward_hook(capture_delta_target)
+                handle = self.model.visual.register_forward_hook(capture_third_target)
             elif self.training:
-                raise ValueError("third_delta_loss training requires third-view teacher images")
+                raise ValueError("third_loss training requires third-view teacher images")
 
         try:
             outputs = self.model(**vl_input, output_hidden_states=True)

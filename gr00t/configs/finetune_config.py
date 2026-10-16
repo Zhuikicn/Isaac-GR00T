@@ -16,6 +16,7 @@
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
 import math
+from typing import Literal
 import warnings
 
 
@@ -59,14 +60,18 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    third_loss: bool = False
+    """Enable third-view supervision with MLP, Transformer or DiT queries."""
+    third_framework: Literal["mlp", "queries", "transformer"] = "mlp"
+    third_prediction_target: Literal["third", "delta"] = "third"
+    third_target: Literal["visual_encoder"] = "visual_encoder"
+    third_loss_weight: float = 0.5
+
     use_third_view_aux_loss: bool = False
-    """Enable third-view query supervision and block self-attention over state/queries/actions."""
+    """Align pooled final DiT queries with pooled third-view visual merger features."""
 
     num_learnable_queries: int = 8
-    """Number of learnable DiT queries when third-view supervision is enabled."""
-
-    num_supervised_queries: int = 4
-    """Align this many trailing queries with trailing third-view tokens at the CA midpoint."""
+    """Number of learnable DiT queries for ordinary third-view supervision."""
 
     use_action_query_gate: bool = False
     """Gate action-to-query attention; requires third-view loss and interleaved self-attention."""
@@ -74,14 +79,11 @@ class FinetuneConfig:
     query_gate_init_prob: float = 0.5
     """Initial action-query gate probability, strictly between zero and one."""
 
-    query_target_stage: str = "raw_cosmos"
-    """Third-view target source: raw_cosmos or vl_postprocessor."""
-
     fm_loss_weight: float = 1.0
     """Alpha multiplier for the flow-matching loss."""
 
-    query_cosine_loss_weight: float = 1.0
-    """Beta multiplier for the mean query-to-third-view (1 - cosine similarity) loss."""
+    visual_loss_weight: float = 0.1
+    """Multiplier for visual loss: equal-weight cosine + raw-feature SmoothL1 (beta=1)."""
 
     use_phase_aux_loss: bool = False
     """Predict per-action-frame phases with four DiT queries; incompatible with third-view loss."""
@@ -240,6 +242,26 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if self.third_loss and (
+            self.use_phase_aux_loss or self.use_third_view_aux_loss or self.use_action_query_gate
+        ):
+            raise ValueError(
+                "third_loss is incompatible with phase, third-view loss and query gates"
+            )
+        if self.third_framework not in ("mlp", "queries", "transformer"):
+            raise ValueError("third_framework must be mlp, queries or transformer")
+        if self.third_prediction_target not in ("third", "delta"):
+            raise ValueError("third_prediction_target must be third or delta")
+        if self.third_target != "visual_encoder":
+            raise ValueError("third_target currently supports only visual_encoder")
+        if not math.isfinite(self.third_loss_weight) or self.third_loss_weight < 0:
+            raise ValueError("third_loss_weight must be finite and >= 0")
+        if (
+            self.third_loss
+            and self.third_framework == "queries"
+            and self.num_learnable_queries != 8
+        ):
+            raise ValueError("DiT third supervision requires exactly 8 queries")
         if self.use_phase_aux_loss and (self.use_third_view_aux_loss or self.use_action_query_gate):
             raise ValueError(
                 "Phase supervision is incompatible with third-view loss and query gates"

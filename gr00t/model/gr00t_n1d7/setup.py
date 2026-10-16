@@ -23,6 +23,7 @@ from transformers import AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.configs.third_delta import THIRD_PARAMETER_PREFIXES
 from gr00t.data.dataset.factory import DatasetFactory
 from gr00t.model.base.model_pipeline import ModelPipeline
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
@@ -92,10 +93,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
                 state_noise_std=self.config.model.state_noise_std,
-                third_delta_loss=self.config.model.third_delta_loss,
-                third_delta_framework=self.config.model.third_delta_framework,
-                third_delta_target=self.config.model.third_delta_target,
-                third_delta_loss_weight=self.config.model.third_delta_loss_weight,
+                third_loss=self.config.model.third_loss,
+                third_framework=self.config.model.third_framework,
+                third_target=self.config.model.third_target,
+                third_prediction_target=self.config.model.third_prediction_target,
+                third_loss_weight=self.config.model.third_loss_weight,
                 use_third_view_aux_loss=self.config.model.use_third_view_aux_loss,
                 use_action_query_gate=self.config.model.use_action_query_gate,
                 query_gate_init_prob=self.config.model.query_gate_init_prob,
@@ -160,17 +162,16 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and bool(expected_phase_missing)
                 and actual_phase_missing == expected_phase_missing
             )
-            expected_delta_missing = {
+            expected_third_missing = {
                 name
                 for name, _ in model.named_parameters()
-                if name == "action_head.delta_queries"
-                or name.startswith("action_head.delta_query_head.")
+                if name.startswith(THIRD_PARAMETER_PREFIXES[self.config.model.third_framework])
             }
-            actual_delta_missing = set(missing_keys) & expected_delta_missing
-            initialize_legacy_delta = (
-                self.config.model.third_delta_loss
-                and bool(expected_delta_missing)
-                and actual_delta_missing == expected_delta_missing
+            actual_third_missing = set(missing_keys) & expected_third_missing
+            initialize_third_branch = (
+                self.config.model.third_loss
+                and bool(expected_third_missing)
+                and actual_third_missing == expected_third_missing
             )
             other_missing = [
                 k
@@ -179,7 +180,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 and not (initialize_legacy_aux and k in expected_legacy_aux_missing)
                 and not (initialize_legacy_gate and k in expected_gate_missing)
                 and not (initialize_legacy_phase and k in expected_phase_missing)
-                and not (initialize_legacy_delta and k in expected_delta_missing)
+                and not (initialize_third_branch and k in expected_third_missing)
             ]
             if initialize_legacy_aux:
                 model.action_head.initialize_third_view_aux_parameters()
@@ -199,11 +200,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "Phase auxiliary parameters not in checkpoint; initialized: %s",
                     sorted(expected_phase_missing),
                 )
-            if initialize_legacy_delta:
-                model.action_head.initialize_third_delta_parameters()
-                logging.info(
-                    "Delta queries and MLP absent from base checkpoint; randomly initialized"
+            if initialize_third_branch:
+                third_module = (
+                    model.backbone
+                    if self.config.model.third_framework in ("mlp", "transformer")
+                    else model.action_head
                 )
+                third_module.initialize_third_parameters()
+                logging.info("Third branch absent from base checkpoint; fully initialized")
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -279,10 +283,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
-                third_delta_loss=self.model_config.third_delta_loss,
-                third_delta_framework=self.model_config.third_delta_framework,
-                third_delta_target=self.model_config.third_delta_target,
-                third_delta_loss_weight=self.model_config.third_delta_loss_weight,
+                third_loss=self.model_config.third_loss,
+                third_framework=self.model_config.third_framework,
+                third_target=self.model_config.third_target,
+                third_prediction_target=self.model_config.third_prediction_target,
+                third_loss_weight=self.model_config.third_loss_weight,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,
@@ -321,10 +326,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 state_dropout_prob=self.model_config.state_dropout_prob,
                 state_noise_std=self.model_config.state_noise_std,
                 use_mean_std=self.model_config.use_mean_std,
-                third_delta_loss=self.model_config.third_delta_loss,
-                third_delta_framework=self.model_config.third_delta_framework,
-                third_delta_target=self.model_config.third_delta_target,
-                third_delta_loss_weight=self.model_config.third_delta_loss_weight,
+                third_loss=self.model_config.third_loss,
+                third_framework=self.model_config.third_framework,
+                third_target=self.model_config.third_target,
+                third_prediction_target=self.model_config.third_prediction_target,
+                third_loss_weight=self.model_config.third_loss_weight,
                 use_third_view_aux_loss=self.model_config.use_third_view_aux_loss,
                 third_view_key=self.model_config.third_view_key,
                 num_learnable_queries=self.model_config.num_learnable_queries,

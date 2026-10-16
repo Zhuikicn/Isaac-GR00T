@@ -29,6 +29,7 @@ pipeline is bottlenecked by data loading or by the model's computation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -38,6 +39,12 @@ from typing import Any, Optional
 import torch
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
+
+from gr00t.configs.third_delta import (
+    LEGACY_THIRD_PARAMETER_PREFIXES,
+    THIRD_PARAMETER_PREFIXES,
+    validate_third_checkpoint_config,
+)
 
 
 class ProfCallback(TrainerCallback):
@@ -239,6 +246,24 @@ class Gr00tTrainer(Trainer):
             latest_checkpoint = resume_from_checkpoint  # caller passed an explicit path
 
         if latest_checkpoint is not None:
+            checkpoint_config = os.path.join(latest_checkpoint, "config.json")
+            if os.path.isfile(checkpoint_config):
+                with open(checkpoint_config) as f:
+                    saved_config = json.load(f)
+                validate_third_checkpoint_config(
+                    saved_config,
+                    self.model.config.third_framework,
+                    self.model.config.third_loss,
+                    self.model.config.third_prediction_target,
+                    self.model.config.third_target,
+                )
+                saved_third = bool(saved_config.get("third_loss", False))
+                current_third = bool(getattr(self.model.config, "third_loss", False))
+                if saved_third != current_third:
+                    raise RuntimeError(
+                        "Cannot resume across different third supervision settings; "
+                        "use the same third_loss setting or start a new run from the base model"
+                    )
             logging.info(f"Resuming from checkpoint {latest_checkpoint}")
             # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
             self.state = TrainerState.load_from_json(
@@ -246,6 +271,23 @@ class Gr00tTrainer(Trainer):
             )
 
         return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+
+    def _issue_warnings_after_load(self, load_result):
+        """A resumed third branch must be complete and match the selected architecture."""
+        prefixes = (
+            tuple(p for group in THIRD_PARAMETER_PREFIXES.values() for p in group)
+            + LEGACY_THIRD_PARAMETER_PREFIXES
+        )
+        missing_third = [name for name in load_result.missing_keys if name.startswith(prefixes)]
+        unexpected_third = [
+            name for name in load_result.unexpected_keys if name.startswith(prefixes)
+        ]
+        if missing_third or unexpected_third:
+            raise RuntimeError(
+                "Cannot resume incomplete or incompatible third parameters: "
+                f"missing={missing_third}, unexpected={unexpected_third}"
+            )
+        return super()._issue_warnings_after_load(load_result)
 
     # ------------------------------------------------------------------
     # Loss / accuracy computation override
@@ -284,7 +326,7 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # Log the distributed mean of the FM loss alongside the total training
-        # loss. When third-view supervision is enabled, log its cosine term too.
+        # loss. Third-view supervision also logs both unweighted visual terms.
         # Every Trainer reporter (including wandb) receives these metrics.
         if (
             model.training
@@ -292,9 +334,26 @@ class Gr00tTrainer(Trainer):
             and "fm_loss" in outputs
         ):
             aux_losses = {"fm_loss": outputs["fm_loss"].detach()}
-            if "query_cosine_loss" in outputs:
-                aux_losses["query_cosine_loss"] = outputs["query_cosine_loss"].detach()
-            for name in ("phase_loss", "phase_accuracy", "phase_valid_frames"):
+            for name in (
+                "visual_cosine_loss",
+                "visual_smooth_l1_loss",
+                "visual_loss",
+                "visual_valid_samples",
+                "third_loss",
+                "third_mse",
+                "third_cosine_similarity",
+                "third_relative_zero_mse",
+                "third_valid_tokens",
+                "third_smooth_l1_loss",
+                "third_cosine_loss",
+                "third_valid_groups",
+                "third_reconstructed_mse",
+                "third_reconstructed_cosine_similarity",
+                "third_relative_second_mse",
+                "phase_loss",
+                "phase_accuracy",
+                "phase_valid_frames",
+            ):
                 if name in outputs:
                     aux_losses[name] = outputs[name].detach().float()
             aux_losses.update(

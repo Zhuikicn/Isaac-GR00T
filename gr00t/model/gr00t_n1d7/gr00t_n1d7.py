@@ -26,12 +26,17 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.configs.third_delta import (
+    LEGACY_THIRD_PARAMETER_PREFIXES,
+    THIRD_PARAMETER_PREFIXES,
+    validate_third_checkpoint_config,
+)
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
-from gr00t.model.modules.third_delta import DELTA_QUERY_COUNT, validate_delta_checkpoint_config
+from gr00t.model.modules.third_delta import THIRD_QUERY_COUNT, third_prediction_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -137,16 +142,16 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             self.initialize_phase_aux_parameters()
 
-        if config.third_delta_loss:
-            self.delta_queries = nn.Parameter(
-                torch.empty(DELTA_QUERY_COUNT, self.input_embedding_dim)
+        if config.third_loss and config.third_framework == "queries":
+            self.third_queries = nn.Parameter(
+                torch.empty(THIRD_QUERY_COUNT, self.input_embedding_dim)
             )
-            self.delta_query_head = nn.Sequential(
+            self.third_query_head = nn.Sequential(
                 nn.Linear(self.model.config.output_dim, config.query_ffn_hidden_dim),
                 nn.GELU(),
                 nn.Linear(config.query_ffn_hidden_dim, config.backbone_embedding_dim),
             )
-            self.initialize_third_delta_parameters()
+            self.initialize_third_parameters()
 
         # State dropout parameters
         self.state_dropout_prob = config.state_dropout_prob
@@ -178,10 +183,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
 
-    def initialize_third_delta_parameters(self) -> None:
-        """Initialize all delta query parameters when absent from a base checkpoint."""
-        nn.init.normal_(self.delta_queries, mean=0.0, std=0.02)
-        for module in self.delta_query_head.modules():
+    def initialize_third_parameters(self) -> None:
+        """Initialize all third-view query parameters when absent from a base checkpoint."""
+        nn.init.normal_(self.third_queries, mean=0.0, std=0.02)
+        for module in self.third_query_head.modules():
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters()
 
@@ -228,7 +233,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self, hidden_states: torch.Tensor, num_state_tokens: int
     ) -> torch.Tensor | None:
         """Restrict auxiliary context reads while allowing actions to read every token."""
-        if self.config.third_delta_loss:
+        if self.config.third_loss and self.config.third_framework == "queries":
             # State, queries and actions all read each other bidirectionally.
             return None
         if self.config.use_phase_aux_loss:
@@ -267,9 +272,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             if self.config.use_phase_aux_loss:
                 self.phase_queries.requires_grad_(False)
                 self.phase_head.requires_grad_(False)
-            if self.config.third_delta_loss:
-                self.delta_queries.requires_grad_(False)
-                self.delta_query_head.requires_grad_(False)
+            if self.config.third_loss and self.config.third_framework == "queries":
+                self.third_queries.requires_grad_(False)
+                self.third_query_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         if not tune_vlln:
@@ -303,8 +308,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.query_head.eval()
                 if self.config.use_phase_aux_loss:
                     self.phase_head.eval()
-                if self.config.third_delta_loss:
-                    self.delta_query_head.eval()
+                if self.config.third_loss and self.config.third_framework == "queries":
+                    self.third_query_head.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
             if not self.tune_vlln:
@@ -385,26 +390,35 @@ class Gr00tN1d7ActionHead(nn.Module):
             "visual_valid_samples": count,
         }
 
-    def _delta_outputs(
+    def _third_outputs(
         self, model_output: torch.Tensor, num_state_tokens: int, backbone_output: BatchFeature
     ) -> dict:
-        if "third_delta_target" not in backbone_output:
-            raise ValueError("DiT delta supervision requires third-view teacher targets")
-        query_states = model_output[:, num_state_tokens : num_state_tokens + DELTA_QUERY_COUNT]
-        prediction = self.delta_query_head(query_states).float()
-        target = backbone_output.third_delta_target.detach().float()
+        if "third_prediction_target" not in backbone_output:
+            raise ValueError("DiT third supervision requires third-view teacher targets")
+        query_states = model_output[:, num_state_tokens : num_state_tokens + THIRD_QUERY_COUNT]
+        prediction = self.third_query_head(query_states).float()
+        target = backbone_output.third_prediction_target.detach().float()
         if prediction.shape != target.shape:
-            raise ValueError("Delta query predictions and targets must have shape [B, 8, D]")
+            raise ValueError("Third query predictions and targets must have shape [B, 8, D]")
         smooth_l1_loss = F.smooth_l1_loss(prediction, target, beta=1.0)
         cosine = F.cosine_similarity(prediction, target, dim=-1, eps=1e-8).mean()
         cosine_loss = 1 - cosine
-        return {
-            "third_delta_loss": smooth_l1_loss + 0.1 * cosine_loss,
-            "third_delta_smooth_l1_loss": smooth_l1_loss,
-            "third_delta_cosine_loss": cosine_loss,
-            "third_delta_cosine_similarity": cosine.detach(),
-            "third_delta_valid_groups": target.new_tensor(target.shape[0] * DELTA_QUERY_COUNT),
-        }
+        metrics = third_prediction_metrics(
+            prediction,
+            target,
+            backbone_output.third_second_target.detach(),
+            backbone_output.third_teacher_target.detach(),
+            self.config.third_prediction_target,
+        )
+        metrics.update(
+            {
+                "third_loss": smooth_l1_loss + 0.1 * cosine_loss,
+                "third_smooth_l1_loss": smooth_l1_loss,
+                "third_cosine_loss": cosine_loss,
+                "third_valid_groups": target.new_tensor(target.shape[0] * THIRD_QUERY_COUNT),
+            }
+        )
+        return metrics
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -474,8 +488,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Learned queries receive no action position embedding.
-        if self.config.third_delta_loss:
-            query_features = self.delta_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
+        if self.config.third_loss and self.config.third_framework == "queries":
+            query_features = self.third_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
         elif self.config.use_third_view_aux_loss:
             query_features = self.learnable_queries.unsqueeze(0).expand(actions.shape[0], -1, -1)
@@ -546,14 +560,10 @@ class Gr00tN1d7ActionHead(nn.Module):
         else:
             loss = fm_loss
 
-        delta_outputs = {}
-        if self.config.third_delta_loss:
-            delta_outputs = self._delta_outputs(
+        third_outputs = {}
+        if self.config.third_loss and self.config.third_framework == "queries":
+            third_outputs = self._third_outputs(
                 model_output, state_features.shape[1], full_backbone_output
-            )
-            loss = (
-                self.config.fm_loss_weight * fm_loss
-                + self.config.third_delta_loss_weight * delta_outputs["third_delta_loss"]
             )
 
         phase_outputs = {}
@@ -578,7 +588,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         output.update(visual_outputs)
         output.update(gate_stats)
         output.update(phase_outputs)
-        output.update(delta_outputs)
+        output.update(third_outputs)
         return output
 
     def _encode_features(
@@ -706,8 +716,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            if self.config.third_delta_loss:
-                query_features = self.delta_queries.unsqueeze(0).expand(batch_size, -1, -1)
+            if self.config.third_loss and self.config.third_framework == "queries":
+                query_features = self.third_queries.unsqueeze(0).expand(batch_size, -1, -1)
                 sa_embs = torch.cat((state_features, query_features, action_features), dim=1)
             elif self.config.use_third_view_aux_loss:
                 query_features = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
@@ -832,7 +842,9 @@ class Gr00tN1d7(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        """Reject old delta checkpoints and initialize only a complete missing query branch."""
+        """Validate the architecture/target and initialize a complete new third branch."""
+        if any(key.startswith("third_delta_") for key in kwargs):
+            raise ValueError("Legacy third_delta_* options are not supported; use third_* options")
         config_kwargs = {
             key: kwargs[key]
             for key in (
@@ -848,52 +860,65 @@ class Gr00tN1d7(PreTrainedModel):
         checkpoint_config, _ = cls.config_class.get_config_dict(
             pretrained_model_name_or_path, **config_kwargs
         )
-        validate_delta_checkpoint_config(checkpoint_config)
+        requested_config = kwargs.get("config")
+        validate_third_checkpoint_config(
+            checkpoint_config,
+            kwargs.get("third_framework", getattr(requested_config, "third_framework", None)),
+            kwargs.get("third_loss", getattr(requested_config, "third_loss", None)),
+            kwargs.get(
+                "third_prediction_target",
+                getattr(requested_config, "third_prediction_target", None),
+            ),
+            kwargs.get("third_target", getattr(requested_config, "third_target", None)),
+        )
         return_loading_info = kwargs.pop("output_loading_info", False)
         model, loading_info = super().from_pretrained(
             pretrained_model_name_or_path, *model_args, output_loading_info=True, **kwargs
         )
-        old_delta_keys = [
+        validate_third_checkpoint_config(
+            checkpoint_config,
+            model.config.third_framework,
+            model.config.third_loss,
+            model.config.third_prediction_target,
+            model.config.third_target,
+        )
+        all_prefixes = tuple(p for prefixes in THIRD_PARAMETER_PREFIXES.values() for p in prefixes)
+        incompatible = [
             name
             for name in loading_info.get("unexpected_keys", [])
-            if name.startswith("backbone.third_delta_head.")
+            if name.startswith(all_prefixes + LEGACY_THIRD_PARAMETER_PREFIXES)
         ]
-        if old_delta_keys:
+        if incompatible:
             raise RuntimeError(
-                "Old LLM-input delta compensation weights cannot load into DiT delta queries"
+                f"Checkpoint contains incompatible, mixed or legacy third parameters: {incompatible}"
             )
-        if checkpoint_config.get("third_delta_loss") and not model.config.third_delta_loss:
-            raise RuntimeError(
-                "Cannot disable DiT delta queries when loading a delta-query checkpoint"
-            )
-        if model.config.third_delta_loss:
-            delta_keys = {
-                name
-                for name, _ in model.named_parameters()
-                if name == "action_head.delta_queries"
-                or name.startswith("action_head.delta_query_head.")
-            }
-            missing = set(loading_info.get("missing_keys", [])) & delta_keys
+        if model.config.third_loss:
+            prefixes = THIRD_PARAMETER_PREFIXES[model.config.third_framework]
+            third_keys = {name for name, _ in model.named_parameters() if name.startswith(prefixes)}
+            missing = set(loading_info.get("missing_keys", [])) & third_keys
             mismatched = [
                 item
                 for item in loading_info.get("mismatched_keys", [])
-                if (item if isinstance(item, str) else item[0]) in delta_keys
+                if (item if isinstance(item, str) else item[0]) in third_keys
             ]
             if mismatched or (
-                missing and (missing != delta_keys or checkpoint_config.get("third_delta_loss"))
+                missing and (missing != third_keys or checkpoint_config.get("third_loss"))
             ):
                 raise RuntimeError(
-                    "Delta query checkpoint has partially missing or mismatched parameters"
+                    "Third checkpoint has partially missing or mismatched parameters"
                 )
             if missing:
-                model.action_head.initialize_third_delta_parameters()
-                logger.info(
-                    "Delta queries and MLP absent from base checkpoint; randomly initialized"
+                third_module = (
+                    model.backbone
+                    if model.config.third_framework in ("mlp", "transformer")
+                    else model.action_head
                 )
+                third_module.initialize_third_parameters()
+                logger.info("Third branch absent from base checkpoint; fully initialized")
                 # These parameters were explicitly initialized; pipeline strict checks
                 # must still reject every other missing or mismatched checkpoint key.
                 loading_info["missing_keys"] = [
-                    key for key in loading_info["missing_keys"] if key not in delta_keys
+                    key for key in loading_info["missing_keys"] if key not in third_keys
                 ]
         return (model, loading_info) if return_loading_info else model
 
@@ -932,9 +957,10 @@ class Gr00tN1d7(PreTrainedModel):
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             use_third_view_aux_loss=config.use_third_view_aux_loss,
-            third_delta_loss=config.third_delta_loss,
-            third_delta_framework=config.third_delta_framework,
-            third_delta_target=config.third_delta_target,
+            third_loss=config.third_loss,
+            third_framework=config.third_framework,
+            third_target=config.third_target,
+            third_prediction_target=config.third_prediction_target,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
 
@@ -947,7 +973,9 @@ class Gr00tN1d7(PreTrainedModel):
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
             use_third_view_aux_loss=config.use_third_view_aux_loss,
-            third_delta_loss=config.third_delta_loss,
+            third_loss=config.third_loss,
+            third_framework=config.third_framework,
+            third_prediction_target=config.third_prediction_target,
             num_learnable_queries=config.num_learnable_queries,
         )
 
@@ -1000,6 +1028,24 @@ class Gr00tN1d7(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_outputs = self.action_head(backbone_outputs, action_inputs)
+        if self.config.third_loss:
+            third_outputs = (
+                backbone_outputs
+                if self.config.third_framework in ("mlp", "transformer")
+                else action_outputs
+            )
+            if "third_loss" not in third_outputs:
+                raise ValueError(
+                    "Third-view training requires teacher targets and an auxiliary loss"
+                )
+            action_outputs["loss"] = (
+                self.config.fm_loss_weight * action_outputs["fm_loss"]
+                + self.config.third_loss_weight * third_outputs["third_loss"]
+            )
+            if self.config.third_framework in ("mlp", "transformer"):
+                action_outputs.update(
+                    {k: v for k, v in third_outputs.items() if k.startswith("third_")}
+                )
         return action_outputs
 
     def get_action(self, inputs: dict, options: dict[str, Any] | None = None) -> BatchFeature:

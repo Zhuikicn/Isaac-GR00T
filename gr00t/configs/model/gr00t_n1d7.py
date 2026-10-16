@@ -22,6 +22,12 @@ from pathlib import Path
 import torch
 from transformers import PretrainedConfig
 
+from gr00t.configs.third_delta import (
+    normalize_third_config,
+    reject_legacy_third_config,
+    third_architecture_version,
+)
+
 from . import register_model_config
 
 
@@ -115,14 +121,15 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
 
-    # Eight final DiT queries predict pooled third-minus-second merger features.
-    third_delta_loss: bool = False
-    # Serialized architecture marker; old input-compensation checkpoints used version 1.
-    third_delta_version: int = 2
+    # Select LLM-input feature prediction or eight final DiT supervision queries.
+    third_loss: bool = False
+    # Derived from the explicitly selected framework and saved with checkpoints.
+    third_version: int = 1
     # OmegaConf structured configs require str; allowed values are validated below.
-    third_delta_framework: str = "mlp"
-    third_delta_target: str = "visual_encoder"
-    third_delta_loss_weight: float = 0.5
+    third_framework: str = "mlp"
+    third_prediction_target: str = "third"
+    third_target: str = "visual_encoder"
+    third_loss_weight: float = 0.5
 
     # Third-view representation auxiliary objective. This is intentionally
     # opt-in so models without auxiliary supervision keep their architecture.
@@ -156,6 +163,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_num_embodiments: int = 32
 
     def __init__(self, **kwargs):
+        reject_legacy_third_config(kwargs)
+        if "third_version" in kwargs and kwargs["third_version"] != third_architecture_version(
+            kwargs.get("third_framework", "mlp")
+        ):
+            raise ValueError("Requested third version does not match selected framework")
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -174,25 +186,41 @@ class Gr00tN1d7Config(PretrainedConfig):
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
         self.validate_phase_config()
 
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        reject_legacy_third_config(kwargs)
+        normalized = normalize_third_config(
+            config_dict,
+            kwargs.get("third_framework"),
+            kwargs.get("third_loss"),
+            kwargs.get("third_prediction_target"),
+            kwargs.get("third_target"),
+        )
+        if "third_version" in kwargs and kwargs["third_version"] != normalized["third_version"]:
+            raise ValueError("Requested delta version does not match the selected framework")
+        result = super().from_dict(normalized, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        config.validate_phase_config()
+        return result
+
     def validate_phase_config(self) -> None:
-        if self.third_delta_loss and (
+        if self.third_loss and (
             self.use_phase_aux_loss or self.use_third_view_aux_loss or self.use_action_query_gate
         ):
             raise ValueError(
-                "third_delta_loss is incompatible with phase, third-view loss and query gates"
+                "third_loss is incompatible with phase, third-view loss and query gates"
             )
-        if self.third_delta_framework != "mlp":
-            raise ValueError("third_delta_framework currently supports only mlp")
-        if self.third_delta_target != "visual_encoder":
-            raise ValueError("third_delta_target currently supports only visual_encoder")
-        if not math.isfinite(self.third_delta_loss_weight) or self.third_delta_loss_weight < 0:
-            raise ValueError("third_delta_loss_weight must be finite and >= 0")
-        if self.third_delta_loss:
-            if self.third_delta_version != 2:
-                raise ValueError("Only DiT delta-query architecture version 2 is supported")
+        self.third_version = third_architecture_version(self.third_framework)
+        if self.third_prediction_target not in ("third", "delta"):
+            raise ValueError("third_prediction_target must be third or delta")
+        if self.third_target != "visual_encoder":
+            raise ValueError("third_target currently supports only visual_encoder")
+        if not math.isfinite(self.third_loss_weight) or self.third_loss_weight < 0:
+            raise ValueError("third_loss_weight must be finite and >= 0")
+        if self.third_loss and self.third_framework == "queries":
             if self.num_learnable_queries != 8 or self.query_ffn_hidden_dim != 4096:
                 raise ValueError(
-                    "DiT delta supervision requires 8 queries and MLP hidden width 4096"
+                    "DiT third supervision requires 8 queries and MLP hidden width 4096"
                 )
             if (
                 not self.diffusion_model_cfg.get("interleave_self_attention", False)
