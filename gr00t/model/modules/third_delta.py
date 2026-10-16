@@ -253,11 +253,9 @@ def compensate_visual_tokens(
             # The LLM scatter requires the original image-embedding dtype.
             compensated[second_index] = reconstructed[row].to(second.dtype)
         if teacher_chunks is not None:
-            teacher_batch = torch.stack([teacher_chunks[index] for _, _, index in rows]).float()
+            teacher_batch = torch.stack([teacher_chunks[index] for _, _, index in rows])
             target = (
-                teacher_batch
-                if prediction_target == "third"
-                else teacher_batch - second.detach().float()
+                teacher_batch if prediction_target == "third" else teacher_batch - second.detach()
             )
             predictions.append(prediction.flatten(0, 1))
             targets.append(target.detach().flatten(0, 1))
@@ -267,7 +265,7 @@ def compensate_visual_tokens(
     if predictions:
         prediction = torch.cat(predictions)
         target = torch.cat(targets)
-        # Respect the enclosing autocast policy; no experiment RMS scaling is used.
+        # Preserve feature dtypes; let the enclosing autocast policy handle MSE.
         loss = F.mse_loss(prediction, target)
         metrics = third_prediction_metrics(
             prediction,
