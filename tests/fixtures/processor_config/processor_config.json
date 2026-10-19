@@ -136,6 +136,12 @@
     "model_name": "nvidia/Cosmos-Reason2-2B",
     "model_type": "qwen",
     "formalize_language": true,
+    "third_loss": false,
+    "third_framework": "mlp",
+    "third_version": 1,
+    "third_target": "visual_encoder",
+    "third_prediction_target": "third",
+    "third_loss_weight": 0.5,
     "use_third_view_aux_loss": false,
     "use_phase_aux_loss": false,
     "phase_label_key": "phase",
@@ -154,6 +160,8 @@
     "use_relative_action": true,
     "exclude_state": false,
     "state_dropout_prob": 0.0,
-    "state_noise_std": 0.0
+    "state_noise_std": 0.0,
+    "hand_state_noise_std": 0.0,
+    "hand_state_dropout_prob": 0.0
   }
 }

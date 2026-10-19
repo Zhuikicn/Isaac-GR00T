@@ -126,6 +126,27 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
 | `--tune-llm` | Enable full-parameter tuning of the retained LLM backbone |
 | `--learning-rate` | Peak learning rate for the action head and other trainable non-LLM modules (default: `1e-4`) |
 | `--llm-learning-rate` | Peak learning rate for trainable LLM parameters (default: `1e-6`; unused when the LLM is frozen) |
+| `--hand-state-noise-std` | Additional Gaussian noise std on normalized `left_hand`/`right_hand` state inputs (default: `0.0`) |
+| `--hand-state-dropout-prob` | Additional probability of zeroing both hands' state inputs together (default: `0.0`) |
+
+Hand state augmentation runs only during training, before the state encoder, and adds to
+the existing global `--state-noise-std` and `--state-dropout-prob` augmentation. It matches
+the state group names `left_hand` and `right_hand` exactly; groups with other names are
+unaffected by these additional parameters. Hand noise is applied after global noise and
+clipped to `[-1, 1]`. Hand dropout then zeros both hands together, including every state
+history frame, while preserving other state inputs. Globally dropped or excluded states
+remain zero. The existing global dropout after the state encoder also remains active.
+Both hand parameters default to zero, preserving previous behavior, and are saved in
+checkpoints. Noise std must be finite and nonnegative; dropout probability must be finite
+and in `[0, 1]`.
+
+Append these arguments to `launch_finetune.py` or training scripts that forward `"$@"`:
+
+```bash
+--hand-state-noise-std 0.05 --hand-state-dropout-prob 0.3
+```
+
+With `examples/finetune.sh`, pass them after its `--` separator.
 
 With `--tune-llm`, the LLM defaults to `1e-6` while the action head stays at `1e-4`.
 For example, `--tune-llm --llm-learning-rate 3e-6` changes only the LLM rate.

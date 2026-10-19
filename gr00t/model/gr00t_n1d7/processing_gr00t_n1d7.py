@@ -356,9 +356,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         phase_num_classes: int = 3,
         phase_mlp_hidden_dim: int = 1024,
         phase_loss_weight: float = 1.0,
+        hand_state_noise_std: float = 0.0,
+        hand_state_dropout_prob: float = 0.0,
     ):
         if not math.isfinite(state_noise_std) or state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {state_noise_std}")
+        if not math.isfinite(hand_state_noise_std) or hand_state_noise_std < 0:
+            raise ValueError("hand_state_noise_std must be finite and >= 0")
+        if not math.isfinite(hand_state_dropout_prob) or not (0 <= hand_state_dropout_prob <= 1):
+            raise ValueError("hand_state_dropout_prob must be finite and in [0, 1]")
         self.modality_configs = parse_modality_configs(modality_configs)
 
         # Initialize StateActionProcessor for state/action normalization
@@ -383,6 +389,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.exclude_state = exclude_state
         self.state_dropout_prob = state_dropout_prob
         self.state_noise_std = state_noise_std
+        self.hand_state_noise_std = hand_state_noise_std
+        self.hand_state_dropout_prob = hand_state_dropout_prob
 
         self.letter_box_transform = letter_box_transform
 
@@ -852,6 +860,32 @@ class Gr00tN1d7Processor(BaseProcessor):
                 normalized_states = (
                     normalized_states + self.state_noise_std * torch.randn_like(normalized_states)
                 ).clamp(-1.0, 1.0)
+            if self.training and (
+                self.hand_state_noise_std > 0 or self.hand_state_dropout_prob > 0
+            ):
+                # Locate hands in the concatenated, normalized state (encoding may change widths).
+                hand_slices = []
+                offset = 0
+                for key in state_keys:
+                    width = norm_state_dict[key].shape[-1]
+                    if key in ("left_hand", "right_hand"):
+                        hand_slices.append(slice(offset, offset + width))
+                    offset += width
+
+                for hand_slice in hand_slices:
+                    if self.hand_state_noise_std > 0:
+                        hand_state = normalized_states[..., hand_slice]
+                        normalized_states[..., hand_slice] = (
+                            hand_state + self.hand_state_noise_std * torch.randn_like(hand_state)
+                        ).clamp(-1.0, 1.0)
+                # One draw per sample: both hands and all their history frames drop together.
+                if (
+                    hand_slices
+                    and self.hand_state_dropout_prob > 0
+                    and random.random() < self.hand_state_dropout_prob
+                ):
+                    for hand_slice in hand_slices:
+                        normalized_states[..., hand_slice] = 0
         normalized_states = torch.cat(
             [
                 normalized_states,
@@ -1068,6 +1102,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "exclude_state": self.exclude_state,
                 "state_dropout_prob": self.state_dropout_prob,
                 "state_noise_std": self.state_noise_std,
+                "hand_state_noise_std": self.hand_state_noise_std,
+                "hand_state_dropout_prob": self.hand_state_dropout_prob,
             },
         }
         with open(main_config_file, "w") as f:
@@ -1151,6 +1187,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
         processor_kwargs.setdefault("state_noise_std", 0.0)
+        processor_kwargs.setdefault("hand_state_noise_std", 0.0)
+        processor_kwargs.setdefault("hand_state_dropout_prob", 0.0)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -1172,6 +1210,8 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "exclude_state",
                 "state_dropout_prob",
                 "state_noise_std",
+                "hand_state_noise_std",
+                "hand_state_dropout_prob",
                 "use_mean_std",
                 "model_name",
                 "model_type",

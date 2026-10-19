@@ -138,6 +138,8 @@ if __name__ == "__main__":
     config.model.validate_phase_config()
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.state_noise_std = ft_config.state_noise_std
+    config.model.hand_state_noise_std = ft_config.hand_state_noise_std
+    config.model.hand_state_dropout_prob = ft_config.hand_state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     config.model.use_percentiles = ft_config.use_percentiles

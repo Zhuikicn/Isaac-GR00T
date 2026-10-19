@@ -156,6 +156,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
     state_noise_std: float = 0.0  # Gaussian noise std on retained normalized state inputs
+    hand_state_noise_std: float = 0.0  # Additional Gaussian noise on normalized hand states
+    hand_state_dropout_prob: float = 0.0  # Additional probability of zeroing both hand inputs
     exclude_state: bool = False  # Zero out all state inputs (ablation)
     use_mean_std: bool = False  # Use mean/std normalization instead of min/max
 
@@ -184,6 +186,12 @@ class Gr00tN1d7Config(PretrainedConfig):
 
         if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
+        if not math.isfinite(self.hand_state_noise_std) or self.hand_state_noise_std < 0:
+            raise ValueError("hand_state_noise_std must be finite and >= 0")
+        if not math.isfinite(self.hand_state_dropout_prob) or not (
+            0 <= self.hand_state_dropout_prob <= 1
+        ):
+            raise ValueError("hand_state_dropout_prob must be finite and in [0, 1]")
         self.validate_phase_config()
 
     @classmethod
