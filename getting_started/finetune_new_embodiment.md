@@ -123,6 +123,21 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
 | `--save-steps` | Save checkpoint every N steps |
 | `--max-steps` | Total number of training steps |
 | `--use-wandb` | Enable Weights & Biases logging for experiment tracking |
+| `--tune-llm` | Enable full-parameter tuning of the retained LLM backbone |
+| `--learning-rate` | Peak learning rate for the action head and other trainable non-LLM modules (default: `1e-4`) |
+| `--llm-learning-rate` | Peak learning rate for trainable LLM parameters (default: `1e-6`; unused when the LLM is frozen) |
+
+With `--tune-llm`, the LLM defaults to `1e-6` while the action head stays at `1e-4`.
+For example, `--tune-llm --llm-learning-rate 3e-6` changes only the LLM rate.
+Both rates follow the same warmup/cosine schedule, and optimizer groups retain the
+existing weight decay exclusions. Logs report `learning_rate` for non-LLM modules
+and `llm_learning_rate` for the LLM. Gradient clipping remains global
+(`max_grad_norm=1.0` by default), computed from raw gradients before the optimizer
+update; learning rates do not rescale the gradients used for clipping.
+
+Full-LLM runs now have separate optimizer groups. To switch an old full-LLM run
+to these rates, start a new run/output directory (optionally loading its model
+weights) instead of resuming its old optimizer/scheduler state.
 
 > **Note:** Validation during fine-tuning is disabled by default (`eval_strategy="no"` in the training config). To enable periodic validation, pass `--eval-strategy steps --eval-steps 500` (runs validation every 500 steps) or `--eval-strategy epoch` (runs validation every epoch). You can also adjust `--eval-batch-size` (default: 2).
 

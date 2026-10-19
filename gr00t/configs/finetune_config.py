@@ -174,7 +174,10 @@ class FinetuneConfig:
     """Number of parallel worker processes used for data loading."""
 
     learning_rate: float = 1e-4
-    """Initial learning rate for optimizer."""
+    """Peak learning rate for trainable parameters outside the LLM."""
+
+    llm_learning_rate: float = 1e-6
+    """Peak learning rate for trainable LLM parameters; unused when the LLM is frozen."""
 
     gradient_accumulation_steps: int = 1
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to

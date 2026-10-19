@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -162,18 +163,79 @@ class Gr00tTrainer(Trainer):
     def __init__(
         self,
         *args: Any,
+        llm_learning_rate: float = 1e-6,
         **kwargs: Any,
     ) -> None:  # noqa: D401 – simple description above
         """Initialize the trainer.
 
         Args:
             *args: Positional arguments forwarded to ``Trainer``.
+            llm_learning_rate: Peak learning rate for trainable LLM parameters.
         """
+        if not math.isfinite(llm_learning_rate) or llm_learning_rate < 0:
+            raise ValueError("llm_learning_rate must be finite and non-negative")
+        self.llm_learning_rate = llm_learning_rate
+        self._llm_learning_rate_for_log = None
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         super().__init__(*args, **kwargs)
 
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        optimizer = super().create_optimizer()
+        backbone = getattr(self.model, "backbone", None)
+        language_model = getattr(getattr(backbone, "model", None), "language_model", None)
+        llm_param_ids = (
+            {id(p) for p in language_model.parameters() if p.requires_grad}
+            if language_model is not None
+            else set()
+        )
+        if not llm_param_ids:
+            return optimizer
+
+        # Split HF's existing decay/no-decay groups before scheduler creation or
+        # DeepSpeed wrapping. Parameter identity also handles Qwen's module aliases.
+        other_groups = []
+        llm_groups = []
+        for group in optimizer.param_groups:
+            other_params = [p for p in group["params"] if id(p) not in llm_param_ids]
+            llm_params = [p for p in group["params"] if id(p) in llm_param_ids]
+            if other_params:
+                other_groups.append({**group, "params": other_params, "is_llm": False})
+            if llm_params:
+                llm_groups.append(
+                    {**group, "params": llm_params, "lr": self.llm_learning_rate, "is_llm": True}
+                )
+        # Keep the ordinary learning_rate metric on the non-LLM group. Clipping
+        # remains global over the original gradients, with no LR-based rescaling.
+        optimizer.param_groups[:] = other_groups + llm_groups
+        for group in optimizer.param_groups:
+            logging.info(
+                "Optimizer group: %s, parameters=%d, learning_rate=%g, weight_decay=%g",
+                "llm" if group["is_llm"] else "non_llm",
+                sum(p.numel() for p in group["params"]),
+                group["lr"],
+                group["weight_decay"],
+            )
+        return optimizer
+
+    def _get_learning_rate(self):
+        learning_rate = super()._get_learning_rate()
+        # HF reads the applied rate before scheduler.step(), then logs afterwards.
+        # Capture both rates together so warmup/decay metrics refer to the same step.
+        self._llm_learning_rate_for_log = None
+        if self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                if group.get("is_llm", False):
+                    self._llm_learning_rate_for_log = float(group["lr"])
+                    break
+        return learning_rate
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        if "learning_rate" in logs and self._llm_learning_rate_for_log is not None:
+            logs["llm_learning_rate"] = self._llm_learning_rate_for_log
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None

@@ -43,6 +43,9 @@ class TrainingConfig:
 
     # Optimization
     learning_rate: float = 1e-4
+    llm_learning_rate: float = 1e-6
+    """Peak learning rate for trainable LLM parameters; other parameters use learning_rate."""
+
     lr_scheduler_type: str = "cosine"
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
