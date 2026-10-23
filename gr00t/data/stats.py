@@ -253,7 +253,14 @@ def generate_stats(dataset_path: Path | str):
     print(f"Generating stats for {str(dataset_path)}")
     with open(dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
         le_features = json.load(f)["features"]
-    lowdim_features = [f for f in le_features if "float" in le_features[f]["dtype"]]
+    relations_prefix = "simulator/movable_objects/relations"
+    lowdim_features = [
+        f
+        for f in le_features
+        if "float" in le_features[f]["dtype"]
+        and f != relations_prefix
+        and not f.startswith(relations_prefix + "/")
+    ]
 
     stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
     existing = _load_stats_cache(stats_path)
