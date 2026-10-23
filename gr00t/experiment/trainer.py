@@ -35,6 +35,7 @@ import math
 import os
 import queue
 import threading
+from copy import deepcopy
 from typing import Any, Optional
 
 import torch
@@ -179,6 +180,28 @@ class Gr00tTrainer(Trainer):
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         super().__init__(*args, **kwargs)
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # Match the default multi-GPU DeepSpeed BF16 weights without casting
+        # the live single-GPU model or changing its optimizer state.
+        save_bf16 = self.args.world_size == 1 and self.args.bf16
+        if save_bf16:
+            if state_dict is None:
+                state_dict = self.model.state_dict()
+            state_dict = {
+                name: tensor.detach().to(
+                    device="cpu",
+                    dtype=torch.bfloat16 if tensor.is_floating_point() else tensor.dtype,
+                )
+                for name, tensor in state_dict.items()
+            }
+        super()._save(output_dir, state_dict=state_dict)
+
+        if save_bf16 and getattr(self.model, "config", None) is not None:
+            # HF derives the saved config dtype from the live FP32 model.
+            config = deepcopy(self.model.config)
+            config.dtype = torch.bfloat16
+            config.save_pretrained(output_dir or self.args.output_dir)
 
     def create_optimizer(self):
         if self.optimizer is not None:
