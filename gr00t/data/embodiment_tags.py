@@ -48,9 +48,10 @@ class EmbodimentTag(Enum):
 
     Finetuning tag (for custom robots):
     - NEW_EMBODIMENT        -> "new_embodiment"
+    - MY_G1                 -> "my_g1"
+    - MY_G1_BINARY          -> "my_g1_binary"
     - ROBOCASA_PANDA_OMRON  -> "robocasa_panda_omron"
     - ROBOCASA_GR1_TABLETOP -> "robocasa_gr1_tabletop"
-    - MY_G1                 -> "my g1 data"
     Use ``EmbodimentTag.resolve(s)`` to look up a tag by name or value,
     case-insensitively.
     """
@@ -129,7 +130,15 @@ class EmbodimentTag(Enum):
     """
     Any new embodiment.
     """
+
+    MY_G1_BINARY = "my_g1_binary"
+    """Locomanip G1 with SONIC motion tokens and signed binary Dex3 state/actions."""
+
     MY_G1 = "my_g1"
+    """
+    Locomanip G1 with SONIC motion-token and Dex3 target actions.
+    """
+
     ROBOCASA_GR1_TABLETOP = "robocasa_gr1_tabletop"
     """
     RoboCasa GR1 tabletop tasks with arms, waist, and Fourier hands.
@@ -217,6 +226,8 @@ POSTTRAIN_TAGS: frozenset[EmbodimentTag] = frozenset(
 FINETUNE_ONLY_TAGS: frozenset[EmbodimentTag] = frozenset(
     {
         EmbodimentTag.NEW_EMBODIMENT,
+        EmbodimentTag.MY_G1,
+        EmbodimentTag.MY_G1_BINARY,
         EmbodimentTag.ROBOCASA_PANDA_OMRON,
         EmbodimentTag.ROBOCASA_GR1_TABLETOP,
     }
