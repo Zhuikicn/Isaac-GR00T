@@ -106,13 +106,10 @@ class FinetuneConfig:
     """
 
     state_noise_std: float = 0.02
-    """Gaussian noise std on retained normalized states, clipped to [-1, 1]; 0 disables it."""
+    """Gaussian noise std on retained normalized states, excluding MY_G1_BINARY hands."""
 
-    hand_state_noise_std: float = 0.0
-    """Additional Gaussian noise std on normalized left_hand/right_hand states during training."""
-
-    hand_state_dropout_prob: float = 0.0
-    """Additional probability of zeroing both hands' state inputs together during training."""
+    swap_hand_state: float = 0.05
+    """Training sign-flip probability per MY_G1_BINARY hand, shared across its history frames."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
@@ -285,12 +282,8 @@ class FinetuneConfig:
             raise ValueError("phase_loss_weight must be finite and >= 0")
         if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
-        if not math.isfinite(self.hand_state_noise_std) or self.hand_state_noise_std < 0:
-            raise ValueError("hand_state_noise_std must be finite and >= 0")
-        if not math.isfinite(self.hand_state_dropout_prob) or not (
-            0 <= self.hand_state_dropout_prob <= 1
-        ):
-            raise ValueError("hand_state_dropout_prob must be finite and in [0, 1]")
+        if not math.isfinite(self.swap_hand_state) or not (0 <= self.swap_hand_state <= 1):
+            raise ValueError("swap_hand_state must be finite and in [0, 1]")
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

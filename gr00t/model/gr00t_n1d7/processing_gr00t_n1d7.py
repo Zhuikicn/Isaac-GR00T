@@ -357,15 +357,12 @@ class Gr00tN1d7Processor(BaseProcessor):
         phase_num_classes: int = 3,
         phase_mlp_hidden_dim: int = 1024,
         phase_loss_weight: float = 1.0,
-        hand_state_noise_std: float = 0.0,
-        hand_state_dropout_prob: float = 0.0,
+        swap_hand_state: float = 0.05,
     ):
         if not math.isfinite(state_noise_std) or state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {state_noise_std}")
-        if not math.isfinite(hand_state_noise_std) or hand_state_noise_std < 0:
-            raise ValueError("hand_state_noise_std must be finite and >= 0")
-        if not math.isfinite(hand_state_dropout_prob) or not (0 <= hand_state_dropout_prob <= 1):
-            raise ValueError("hand_state_dropout_prob must be finite and in [0, 1]")
+        if not math.isfinite(swap_hand_state) or not (0 <= swap_hand_state <= 1):
+            raise ValueError("swap_hand_state must be finite and in [0, 1]")
         self.modality_configs = parse_modality_configs(modality_configs)
 
         # Initialize StateActionProcessor for state/action normalization
@@ -390,8 +387,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         self.exclude_state = exclude_state
         self.state_dropout_prob = state_dropout_prob
         self.state_noise_std = state_noise_std
-        self.hand_state_noise_std = hand_state_noise_std
-        self.hand_state_dropout_prob = hand_state_dropout_prob
+        self.swap_hand_state = swap_hand_state
 
         self.letter_box_transform = letter_box_transform
 
@@ -857,15 +853,9 @@ class Gr00tN1d7Processor(BaseProcessor):
             normalized_states = torch.cat(
                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
             )
-            if self.training and self.state_noise_std > 0:
-                normalized_states = (
-                    normalized_states + self.state_noise_std * torch.randn_like(normalized_states)
-                ).clamp(-1.0, 1.0)
-            if self.training and (
-                self.hand_state_noise_std > 0 or self.hand_state_dropout_prob > 0
-            ):
-                # Locate hands in the concatenated, normalized state (encoding may change widths).
-                hand_slices = []
+            hand_slices = []
+            if self.training and embodiment_tag == EmbodimentTag.MY_G1_BINARY:
+                # Use processed widths because non-hand state encoding may change dimensions.
                 offset = 0
                 for key in state_keys:
                     width = norm_state_dict[key].shape[-1]
@@ -873,20 +863,19 @@ class Gr00tN1d7Processor(BaseProcessor):
                         hand_slices.append(slice(offset, offset + width))
                     offset += width
 
+            if self.training and self.state_noise_std > 0:
+                noise_mask = torch.ones(normalized_states.shape[-1], dtype=torch.bool)
                 for hand_slice in hand_slices:
-                    if self.hand_state_noise_std > 0:
-                        hand_state = normalized_states[..., hand_slice]
-                        normalized_states[..., hand_slice] = (
-                            hand_state + self.hand_state_noise_std * torch.randn_like(hand_state)
-                        ).clamp(-1.0, 1.0)
-                # One draw per sample: both hands and all their history frames drop together.
-                if (
-                    hand_slices
-                    and self.hand_state_dropout_prob > 0
-                    and random.random() < self.hand_state_dropout_prob
-                ):
-                    for hand_slice in hand_slices:
-                        normalized_states[..., hand_slice] = 0
+                    noise_mask[hand_slice] = False
+                retained_states = normalized_states[..., noise_mask]
+                normalized_states[..., noise_mask] = (
+                    retained_states + self.state_noise_std * torch.randn_like(retained_states)
+                ).clamp(-1.0, 1.0)
+            if self.training and self.swap_hand_state > 0:
+                # Independent draw per hand; all history frames of that hand flip together.
+                for hand_slice in hand_slices:
+                    if random.random() < self.swap_hand_state:
+                        normalized_states[..., hand_slice] *= -1
         normalized_states = torch.cat(
             [
                 normalized_states,
@@ -1103,8 +1092,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "exclude_state": self.exclude_state,
                 "state_dropout_prob": self.state_dropout_prob,
                 "state_noise_std": self.state_noise_std,
-                "hand_state_noise_std": self.hand_state_noise_std,
-                "hand_state_dropout_prob": self.hand_state_dropout_prob,
+                "swap_hand_state": self.swap_hand_state,
             },
         }
         with open(main_config_file, "w") as f:
@@ -1188,8 +1176,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
         processor_kwargs.setdefault("state_noise_std", 0.0)
-        processor_kwargs.setdefault("hand_state_noise_std", 0.0)
-        processor_kwargs.setdefault("hand_state_dropout_prob", 0.0)
+        processor_kwargs.setdefault("swap_hand_state", 0.05)
+        # Older checkpoints may still serialize the removed hand augmentations.
+        processor_kwargs.pop("hand_state_noise_std", None)
+        processor_kwargs.pop("hand_state_dropout_prob", None)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -1211,8 +1201,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "exclude_state",
                 "state_dropout_prob",
                 "state_noise_std",
-                "hand_state_noise_std",
-                "hand_state_dropout_prob",
+                "swap_hand_state",
                 "use_mean_std",
                 "model_name",
                 "model_type",

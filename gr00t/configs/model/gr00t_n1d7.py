@@ -155,9 +155,8 @@ class Gr00tN1d7Config(PretrainedConfig):
 
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
-    state_noise_std: float = 0.0  # Gaussian noise std on retained normalized state inputs
-    hand_state_noise_std: float = 0.0  # Additional Gaussian noise on normalized hand states
-    hand_state_dropout_prob: float = 0.0  # Additional probability of zeroing both hand inputs
+    state_noise_std: float = 0.0  # Gaussian noise on normalized states, excluding binary hands
+    swap_hand_state: float = 0.05  # Independent sign-flip probability per MY_G1_BINARY hand
     exclude_state: bool = False  # Zero out all state inputs (ablation)
     use_mean_std: bool = False  # Use mean/std normalization instead of min/max
 
@@ -165,6 +164,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_num_embodiments: int = 32
 
     def __init__(self, **kwargs):
+        # Ignore removed augmentation fields in older checkpoint configs.
+        kwargs.pop("hand_state_noise_std", None)
+        kwargs.pop("hand_state_dropout_prob", None)
         reject_legacy_third_config(kwargs)
         if "third_version" in kwargs and kwargs["third_version"] != third_architecture_version(
             kwargs.get("third_framework", "mlp")
@@ -186,12 +188,8 @@ class Gr00tN1d7Config(PretrainedConfig):
 
         if not math.isfinite(self.state_noise_std) or self.state_noise_std < 0:
             raise ValueError(f"state_noise_std must be finite and >= 0, got {self.state_noise_std}")
-        if not math.isfinite(self.hand_state_noise_std) or self.hand_state_noise_std < 0:
-            raise ValueError("hand_state_noise_std must be finite and >= 0")
-        if not math.isfinite(self.hand_state_dropout_prob) or not (
-            0 <= self.hand_state_dropout_prob <= 1
-        ):
-            raise ValueError("hand_state_dropout_prob must be finite and in [0, 1]")
+        if not math.isfinite(self.swap_hand_state) or not (0 <= self.swap_hand_state <= 1):
+            raise ValueError("swap_hand_state must be finite and in [0, 1]")
         self.validate_phase_config()
 
     @classmethod
@@ -209,6 +207,8 @@ class Gr00tN1d7Config(PretrainedConfig):
         result = super().from_dict(normalized, **kwargs)
         config = result[0] if isinstance(result, tuple) else result
         config.validate_phase_config()
+        if not math.isfinite(config.swap_hand_state) or not (0 <= config.swap_hand_state <= 1):
+            raise ValueError("swap_hand_state must be finite and in [0, 1]")
         return result
 
     def validate_phase_config(self) -> None:

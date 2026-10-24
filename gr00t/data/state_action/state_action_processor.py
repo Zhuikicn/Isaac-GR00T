@@ -32,6 +32,7 @@ from gr00t.configs.data.embodiment_configs import (
     ActionType,
     ModalityConfig,
 )
+from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
 from gr00t.data.state_action.pose import EndEffectorPose, JointPose
 from gr00t.data.utils import (
@@ -237,6 +238,14 @@ class StateActionProcessor:
                     f"Joint group '{joint_group}' not found in state dict for embodiment '{embodiment_tag}'"
                 )
 
+            # Binary hands already use the model's +/-1 representation.
+            if embodiment_tag == EmbodimentTag.MY_G1_BINARY.value and joint_group in (
+                "left_hand",
+                "right_hand",
+            ):
+                normalized_values[joint_group] = state[joint_group]
+                continue
+
             # Strategy 1: Sin/cos encoding (doubles dimension)
             if sin_cos_keys and joint_group in sin_cos_keys:
                 normalized_values[joint_group] = apply_sin_cos_encoding(state[joint_group])
@@ -299,6 +308,13 @@ class StateActionProcessor:
                 raise KeyError(
                     f"Joint group '{joint_group}' not found in state dict for embodiment '{embodiment_tag}'"
                 )
+
+            if embodiment_tag == EmbodimentTag.MY_G1_BINARY.value and joint_group in (
+                "left_hand",
+                "right_hand",
+            ):
+                unnormalized_values[joint_group] = state[joint_group].copy()
+                continue
 
             # Sin/cos encoding is not reversible
             if sin_cos_keys and joint_group in sin_cos_keys:
@@ -401,6 +417,13 @@ class StateActionProcessor:
                     f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
                 )
 
+            if embodiment_tag == EmbodimentTag.MY_G1_BINARY.value and joint_group in (
+                "left_hand_close",
+                "right_hand_close",
+            ):
+                normalized_values[joint_group] = action[joint_group]
+                continue
+
             params = self.norm_params[embodiment_tag]["action"][joint_group]
             if (
                 self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
@@ -455,6 +478,13 @@ class StateActionProcessor:
                 raise KeyError(
                     f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
                 )
+
+            if embodiment_tag == EmbodimentTag.MY_G1_BINARY.value and joint_group in (
+                "left_hand_close",
+                "right_hand_close",
+            ):
+                unnormalized_values[joint_group] = action[joint_group].copy()
+                continue
 
             params = self.norm_params[embodiment_tag]["action"][joint_group]
             group_values = action[joint_group]

@@ -126,24 +126,29 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
 | `--tune-llm` | Enable full-parameter tuning of the retained LLM backbone |
 | `--learning-rate` | Peak learning rate for the action head and other trainable non-LLM modules (default: `1e-4`) |
 | `--llm-learning-rate` | Peak learning rate for trainable LLM parameters (default: `1e-6`; unused when the LLM is frozen) |
-| `--hand-state-noise-std` | Additional Gaussian noise std on normalized `left_hand`/`right_hand` state inputs (default: `0.0`) |
-| `--hand-state-dropout-prob` | Additional probability of zeroing both hands' state inputs together (default: `0.0`) |
+| `--swap-hand-state` | Independent sign-flip probability per `MY_G1_BINARY` hand state during training (default: `0.05`; `0` disables it) |
 
-Hand state augmentation runs only during training, before the state encoder, and adds to
-the existing global `--state-noise-std` and `--state-dropout-prob` augmentation. It matches
-the state group names `left_hand` and `right_hand` exactly; groups with other names are
-unaffected by these additional parameters. Hand noise is applied after global noise and
-clipped to `[-1, 1]`. Hand dropout then zeros both hands together, including every state
-history frame, while preserving other state inputs. Globally dropped or excluded states
-remain zero. The existing global dropout after the state encoder also remains active.
-Both hand parameters default to zero, preserving previous behavior, and are saved in
-checkpoints. Noise std must be finite and nonnegative; dropout probability must be finite
-and in `[0, 1]`.
+For `MY_G1_BINARY`, the `left_hand`/`right_hand` state groups and
+`left_hand_close`/`right_hand_close` action groups pass through normalization and
+denormalization unchanged. Hand states also skip sin/cos encoding and global
+`--state-noise-std`; other state groups retain their existing noise and clipping behavior.
+Hand action predictions pass through without thresholding or clipping.
+
+During training, `--swap-hand-state` independently samples each hand and multiplies its
+state by `-1`, flipping `+1` and `-1` together across all history frames of that hand.
+Action targets remain unchanged. This augmentation does not run during evaluation or
+inference, and other embodiment tags are unaffected. Global `--state-dropout-prob` and
+excluded states still take precedence: zeroed states remain zero. The existing global
+dropout after the state encoder also remains active.
+
+The probability must be finite and in `[0, 1]` and is saved in checkpoints. Older
+checkpoints without this field use `0.05`; their removed hand noise/dropout settings
+are ignored when loading.
 
 Append these arguments to `launch_finetune.py` or training scripts that forward `"$@"`:
 
 ```bash
---hand-state-noise-std 0.05 --hand-state-dropout-prob 0.3
+--swap-hand-state 0.05
 ```
 
 With `examples/finetune.sh`, pass them after its `--` separator.
