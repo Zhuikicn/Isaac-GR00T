@@ -119,6 +119,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
 | `--dataset-path` | Path to your training dataset |
 | `--embodiment-tag` | Tag to identify your robot embodiment |
 | `--modality-config-path` | Path to user-specified modality config (required only for `NEW_EMBODIMENT` tag) |
+| `--action-horizon` | Model prediction length and processor padded action length in frames (default: `40`) |
 | `--output-dir` | Directory where checkpoints will be saved |
 | `--save-steps` | Save checkpoint every N steps |
 | `--max-steps` | Total number of training steps |
@@ -127,6 +128,35 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
 | `--learning-rate` | Peak learning rate for the action head and other trainable non-LLM modules (default: `1e-4`) |
 | `--llm-learning-rate` | Peak learning rate for trainable LLM parameters (default: `1e-6`; unused when the LLM is frozen) |
 | `--swap-hand-state` | Independent sign-flip probability per `MY_G1_BINARY` hand state during training (default: `0.05`; `0` disables it) |
+
+### Action Prediction Horizon
+
+The model's `--action-horizon` and the modality config's action `delta_indices`
+control the prediction and supervision lengths. For 80 contiguous supervised
+frames, set `action.delta_indices=list(range(80))` in your modality config and run:
+
+```bash
+source .venv/bin/activate
+bash examples/finetune.sh \
+    --base-model-path nvidia/GR00T-N1.7-3B \
+    --dataset-path /path/to/dataset \
+    --embodiment-tag NEW_EMBODIMENT \
+    --modality-config-path /path/to/modality_config.py \
+    --action-horizon 80 \
+    --output-dir /path/to/checkpoint_h80
+```
+
+The same `--action-horizon 80` option works directly with `launch_finetune.py`.
+It sets the action head's generation length when loading pretrained weights and
+the processor's `max_action_horizon`; both settings are saved with the checkpoint.
+The modality config determines the returned action length at inference. Use
+matching lengths to train and return all 80 frames. Shorter modality action
+sequences are padded with masked supervision; longer sequences require a larger
+model horizon. Existing per-frame LeRobot datasets can be reused with the chosen
+modality config. At 50 Hz, 80 frames cover 1.6 seconds. Deployment's
+`--execution-horizon` separately selects how many frames to execute per policy call.
+
+### Binary Hand State Augmentation
 
 For `MY_G1_BINARY`, the `left_hand`/`right_hand` state groups and
 `left_hand_close`/`right_hand_close` action groups pass through normalization and

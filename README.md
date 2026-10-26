@@ -477,6 +477,17 @@ uv run torchrun --nproc_per_node=8 --master_port=29500 \
 
 Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with your own dataset and modality config. See [`examples/SO100`](examples/SO100/README.md) for a complete walkthrough.
 
+The training option `--action-horizon` sets the model's prediction length and the
+processor's padded action length (default: `40`). For an 80-frame prediction,
+set `action.delta_indices=list(range(80))` in your modality config and pass
+`--action-horizon 80` to `launch_finetune.py` or `examples/finetune.sh`. At 50 Hz,
+80 frames cover 1.6 seconds. Existing per-frame LeRobot data can be reused; the
+loader assembles action chunks during training. The modality config selects the
+supervised frames and its action length must fit within the model horizon.
+Deployment's `--execution-horizon` controls how many predicted frames are executed
+per policy call. See the [action horizon guide](getting_started/finetune_new_embodiment.md#action-prediction-horizon)
+for a complete command.
+
 > **Note:** Use `uv run torchrun` (not bare `torchrun`) to ensure the correct virtual environment is used. Add `--use-wandb` to enable Weights & Biases logging. For more extensive configuration, use `gr00t/experiment/launch_train.py`.
 
 ### Training Tips

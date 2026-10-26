@@ -86,6 +86,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 # training this override points the backbone at the resolved
                 # local Cosmos snapshot instead.
                 model_name=self.model_config.model_name,
+                action_horizon=self.model_config.action_horizon,
                 tune_llm=self.config.model.tune_llm,
                 tune_visual=self.config.model.tune_visual,
                 tune_projector=self.config.model.tune_projector,

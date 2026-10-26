@@ -17,6 +17,7 @@ DS_WEIGHTS_ALPHA="${DS_WEIGHTS_ALPHA:-}"
 BASE_MODEL_PATH=""
 DATASET_PATH=""
 MODALITY_CONFIG_PATH=""
+ACTION_HORIZON=""
 EMBODIMENT_TAG=""
 OUTPUT_DIR=""
 EXPERIMENT_NAME=""
@@ -36,6 +37,7 @@ Usage: bash examples/finetune.sh \
   --embodiment-tag <tag> \
   --output-dir <path> \
   [--modality-config-path <path>] \
+  [--action-horizon <frames>] \
   [--state-dropout-prob <value>] \
   [--color-jitter-params "brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"] \
   [--use-percentiles <true|false>] \
@@ -64,6 +66,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --embodiment-tag)
             EMBODIMENT_TAG="$2"
+            shift 2
+            ;;
+        --action-horizon)
+            ACTION_HORIZON="$2"
             shift 2
             ;;
         --output-dir)
@@ -163,6 +169,9 @@ LAUNCH_CMD=(
 
 if [ -n "$MODALITY_CONFIG_PATH" ]; then
     LAUNCH_CMD+=(--modality_config_path "$MODALITY_CONFIG_PATH")
+fi
+if [ -n "$ACTION_HORIZON" ]; then
+    LAUNCH_CMD+=(--action-horizon "$ACTION_HORIZON")
 fi
 if [ -n "$EXPERIMENT_NAME" ]; then
     LAUNCH_CMD+=(--experiment_name "$EXPERIMENT_NAME")

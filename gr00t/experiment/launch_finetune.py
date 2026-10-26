@@ -115,6 +115,7 @@ if __name__ == "__main__":
     config.load_config_path = None
 
     # overwrite with finetune config supplied by the user
+    config.model.action_horizon = ft_config.action_horizon
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
     config.model.tune_projector = ft_config.tune_projector
