@@ -21,6 +21,7 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from copy import deepcopy
+import math
 from pathlib import Path
 from typing import Any
 
@@ -385,6 +386,64 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    def _prepare_rtc(self, rtc, batch_size):
+        """Validate the wire contract; processor encodes raw actions per sample."""
+        if not isinstance(rtc, dict) or rtc.get("enabled") is not True:
+            raise ValueError("RTC options must be a dictionary with enabled=True")
+        if not getattr(getattr(self.model, "action_head", None), "supports_rtc", False):
+            raise ValueError("RTC is not supported by this model/action head")
+        horizon = len(self.modality_configs["action"].delta_indices)
+        overlap = rtc.get("overlap_steps", 0)
+        frozen = rtc.get("frozen_steps", 0)
+        ramp = rtc.get("ramp_rate", 5.0)
+        if any(type(value) is not int for value in (overlap, frozen)):
+            raise ValueError("RTC overlap_steps and frozen_steps must be integers")
+        if not 0 <= frozen <= overlap <= horizon:
+            raise ValueError("RTC requires 0 <= frozen_steps <= overlap_steps <= action horizon")
+        if not isinstance(ramp, (int, float)) or not math.isfinite(ramp) or ramp <= 0:
+            raise ValueError("RTC ramp_rate must be finite and positive")
+        previous = rtc.get("previous_actions")
+        if previous is None:
+            if overlap or frozen:
+                raise ValueError("RTC bootstrap must have zero overlap/frozen steps")
+        else:
+            keys = self.modality_configs["action"].modality_keys
+            if not isinstance(previous, dict) or set(previous) != set(keys) or overlap == 0:
+                raise ValueError(
+                    "RTC previous_actions must match model action keys and have overlap"
+                )
+            validated = {}
+            params = self.processor.state_action_processor.norm_params[self.embodiment_tag.value][
+                "action"
+            ]
+            for key in keys:
+                value = np.asarray(previous[key])
+                width = int(params[key]["dim"].item())
+                if value.shape != (batch_size, horizon, width) or not np.issubdtype(
+                    value.dtype, np.floating
+                ):
+                    raise ValueError(
+                        f"RTC {key} must be floating ({batch_size}, {horizon}, {width})"
+                    )
+                if not np.isfinite(value).all():
+                    raise ValueError(f"RTC {key} contains nonfinite values")
+                validated[key] = value.astype(np.float32, copy=True)
+            previous = validated
+        model_options = {
+            "action_horizon": horizon,
+            "rtc_overlap_steps": overlap,
+            "rtc_frozen_steps": frozen,
+            "rtc_ramp_rate": float(ramp),
+        }
+        info = {
+            "supported": True,
+            "applied": previous is not None,
+            "overlap_steps": overlap,
+            "frozen_steps": frozen,
+            "ramp_rate": float(ramp),
+        }
+        return previous, model_options, info
+
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -399,7 +458,7 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional RTC prefix and sampling parameters.
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -407,11 +466,17 @@ class Gr00tPolicy(BasePolicy):
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
+        rtc = (options or {}).get("rtc")
+        previous, model_options, rtc_info = None, None, None
+        if rtc is not None:
+            previous, model_options, rtc_info = self._prepare_rtc(rtc, len(unbatched_observations))
 
         # Step 2: Process each observation through the VLA processor
         states = []
-        for obs in unbatched_observations:
+        for index, obs in enumerate(unbatched_observations):
             vla_step_data = self._to_vla_step_data(obs)
+            if previous is not None:
+                vla_step_data.actions = {key: value[index] for key, value in previous.items()}
             states.append(vla_step_data.states)  # dict[str, np.ndarray[np.float32, (T, D)]]
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(self.processor(messages))
@@ -422,7 +487,10 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            if rtc is None:
+                model_pred = self.model.get_action(**collated_inputs)
+            else:
+                model_pred = self.model.get_action(**collated_inputs, options=model_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -437,7 +505,7 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        return casted_action, {"rtc": rtc_info} if rtc_info is not None else {}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -46,6 +47,7 @@ class Gr00tN1d7ActionHead(nn.Module):
     """Action head component for flow matching diffusion policy."""
 
     supports_gradient_checkpointing = True
+    supports_rtc = True
 
     def __init__(self, config: Gr00tN1d7Config):
         super().__init__()
@@ -668,11 +670,35 @@ class Gr00tN1d7ActionHead(nn.Module):
             # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
             # rtc_frozen_steps is the number of steps to freeze the action, which is the latency of the policy inference.
             # rtc_ramp_rate is the rate of the ramp of denoising the actions.
-            assert options is not None, "options is not None"
-            assert "action_horizon" in options, "action_horizon is not in options"
-            assert "rtc_overlap_steps" in options, "rtc_overlap_steps is not in options"
-            assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
-            assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
+            required = ("action_horizon", "rtc_overlap_steps", "rtc_frozen_steps", "rtc_ramp_rate")
+            if options is None or any(key not in options for key in required):
+                raise ValueError(f"RTC requires sampling options {required}")
+            horizon, overlap, frozen = (options[key] for key in required[:3])
+            ramp_rate = options["rtc_ramp_rate"]
+            if any(type(value) is not int for value in (horizon, overlap, frozen)):
+                raise ValueError("RTC horizons and steps must be integers")
+            if not 0 <= frozen <= overlap <= horizon <= actions.shape[1] or horizon <= 0:
+                raise ValueError(
+                    "RTC requires 0 <= frozen <= overlap <= effective horizon <= model horizon"
+                )
+            previous = action_input["action"]
+            if (
+                previous.ndim != 3
+                or previous.shape[0] != batch_size
+                or previous.shape[1] < horizon
+                or previous.shape[2] != self.action_dim
+            ):
+                raise ValueError(
+                    "RTC action shape must match batch, padded action dimension, and effective horizon"
+                )
+            if not torch.isfinite(previous).all():
+                raise ValueError("RTC actions must be finite")
+            if (
+                not isinstance(ramp_rate, (int, float))
+                or not math.isfinite(ramp_rate)
+                or ramp_rate <= 0
+            ):
+                raise ValueError("RTC ramp rate must be finite and positive")
 
             action_horizon_before_padding = options["action_horizon"]
 
