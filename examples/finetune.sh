@@ -23,6 +23,7 @@ OUTPUT_DIR=""
 EXPERIMENT_NAME=""
 WANDB_PROJECT=""
 STATE_DROPOUT_PROB=""
+JITER_ARGS=()
 COLOR_JITTER_PARAMS="${COLOR_JITTER_PARAMS:-brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08}"
 USE_PERCENTILES=""
 SHORTEST_IMAGE_EDGE=""
@@ -39,6 +40,7 @@ Usage: bash examples/finetune.sh \
   [--modality-config-path <path>] \
   [--action-horizon <frames>] \
   [--state-dropout-prob <value>] \
+  [--jiter <min-frame-offset> <max-frame-offset>] \
   [--color-jitter-params "brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"] \
   [--use-percentiles <true|false>] \
   [--shortest-image-edge <pixels>] \
@@ -47,6 +49,10 @@ Usage: bash examples/finetune.sh \
   [--save-only-model] \
   [--resume-from-checkpoint] \
   [-- <extra launch_finetune.py args>...]
+
+--jiter a b: integer frame offsets with a < b (negative offsets are allowed).
+Each image time samples uniformly from [a, b]; cameras and masks share the offset.
+Image indices are clamped to the episode bounds; state/action are unchanged.
 EOF
 }
 
@@ -91,6 +97,14 @@ while [ "$#" -gt 0 ]; do
         --color-jitter-params)
             COLOR_JITTER_PARAMS="$2"
             shift 2
+            ;;
+        --jiter)
+            if [ "$#" -lt 3 ] || [[ ! "$2" =~ ^[+-]?[0-9]+$ ]] || [[ ! "$3" =~ ^[+-]?[0-9]+$ ]]; then
+                echo "--jiter requires two integer frame offsets: a b (a < b)" >&2
+                exit 1
+            fi
+            JITER_ARGS=(--jiter "$2" "$3")
+            shift 3
             ;;
         --use-percentiles)
             USE_PERCENTILES="$2"
@@ -165,6 +179,7 @@ LAUNCH_CMD=(
     --shard_size "$SHARD_SIZE"
     --num_shards_per_epoch "$NUM_SHARDS_PER_EPOCH"
     --episode_sampling_rate "$EPISODE_SAMPLING_RATE"
+    "${JITER_ARGS[@]}"
 )
 
 if [ -n "$MODALITY_CONFIG_PATH" ]; then

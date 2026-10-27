@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from gr00t.data.interfaces import ShardedDataset
+from gr00t.data.temporal_jitter import validate_jiter
 from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
 
 from .lerobot_episode_loader import LeRobotEpisodeLoader
@@ -31,15 +32,38 @@ def extract_step_data(
     embodiment_tag: EmbodimentTag,
     allow_padding: bool = False,
     use_phase_aux_loss: bool = False,
+    jiter: tuple[int, int] | None = None,
 ) -> VLAStepData:
     step_data = {}
+    jiter = validate_jiter(jiter)
+    image_offsets = {}
+    if jiter is not None:
+        # Sample once per image time, sharing offsets across all cameras and masks.
+        # NumPy's global RNG follows the existing training/DataLoader worker seeds;
+        # keep the independent shard-scheduling RNG unchanged.
+        image_times = sorted(
+            {
+                delta
+                for modality, config in modality_configs.items()
+                if modality in ("video", "mask")
+                for delta in config.delta_indices
+            }
+        )
+        offsets = np.random.randint(jiter[0], jiter[1] + 1, size=len(image_times))
+        image_offsets = dict(zip(image_times, offsets))
 
     # Extract data for each configured modality
     for modality, config in modality_configs.items():
         step_data[modality] = {}
         # Sample timesteps according to delta indices configuration
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
-        if allow_padding:
+        jitter_images = jiter is not None and modality in ("video", "mask")
+        if jitter_images:
+            indices_to_load = [
+                idx + image_offsets[delta]
+                for idx, delta in zip(indices_to_load, config.delta_indices)
+            ]
+        if allow_padding or jitter_images:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
@@ -145,6 +169,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         allow_padding: bool = False,
         phase_label_key: str | None = None,
         phase_num_classes: int = 3,
+        jiter: tuple[int, int] | None = None,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -154,6 +179,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.episode_sampling_rate = episode_sampling_rate
         self.seed = seed
         self.allow_padding = allow_padding
+        self.jiter = validate_jiter(jiter)
         self.use_phase_aux_loss = phase_label_key is not None
         self.processor = None
         self.rng = np.random.default_rng(seed)
@@ -277,6 +303,7 @@ class ShardedSingleStepDataset(ShardedDataset):
             self.embodiment_tag,
             self.allow_padding,
             self.use_phase_aux_loss,
+            jiter=self.jiter,
         )
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]

@@ -19,6 +19,8 @@ import math
 from typing import Literal
 import warnings
 
+from gr00t.data.temporal_jitter import validate_jiter
+
 
 @dataclass
 class FinetuneConfig:
@@ -118,6 +120,13 @@ class FinetuneConfig:
     """Training sign-flip probability per MY_G1_BINARY hand, shared across its history frames."""
 
     # --- Data Augmentation ---
+    jiter: tuple[int, int] | None = None
+    """Uniform inclusive image frame offset bounds (a < b); state/action stay unchanged.
+
+    Each image time samples independently; cameras and masks share its offset.
+    Out-of-episode image indices are clamped to the first/last frame.
+    """
+
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
 
@@ -254,6 +263,7 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        self.jiter = validate_jiter(self.jiter)
         if self.third_loss and (
             self.use_phase_aux_loss or self.use_third_view_aux_loss or self.use_action_query_gate
         ):

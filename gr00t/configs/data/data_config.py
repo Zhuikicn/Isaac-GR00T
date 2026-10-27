@@ -18,6 +18,7 @@ from typing import Annotated, Any, List, Optional
 
 import tyro
 
+from gr00t.data.temporal_jitter import validate_jiter
 from gr00t.data.types import ModalityConfig
 
 from .embodiment_configs import MODALITY_CONFIGS
@@ -92,6 +93,8 @@ class DataConfig:
     seed: int = 42
     multiprocessing_context: str = "fork"  # Options: "fork", "spawn", and "forkserver"
     allow_padding: bool = False
+    jiter: tuple[int, int] | None = None
+    """Inclusive training image frame offsets (a < b), shared by cameras and masks."""
 
     # Subsample ratio for the dataset
     subsample_ratio: float = 1.0
@@ -99,3 +102,6 @@ class DataConfig:
     # DP Image Config
     image_crop_size: List[int] = field(default_factory=lambda: [244, 244])
     image_target_size: List[int] = field(default_factory=lambda: [224, 224])
+
+    def __post_init__(self) -> None:
+        self.jiter = validate_jiter(self.jiter)

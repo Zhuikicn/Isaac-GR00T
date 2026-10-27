@@ -66,6 +66,7 @@ class DatasetFactory:
                     episode_sampling_rate=self.config.data.episode_sampling_rate,
                     seed=self.config.data.seed,
                     allow_padding=self.config.data.allow_padding,
+                    jiter=self.config.data.jiter,
                     phase_label_key=(
                         self.config.model.phase_label_key
                         if getattr(self.config.model, "use_phase_aux_loss", False)
