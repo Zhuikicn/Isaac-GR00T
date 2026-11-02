@@ -14,7 +14,24 @@ import math
 import time
 
 import torch
+from transformers.integrations import WandbCallback
 from transformers.trainer_callback import TrainerCallback
+
+
+class TimingWandbCallback(WandbCallback):
+    """Keep timing metrics outside HF's default train/ namespace in W&B."""
+
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        timing = {key: value for key, value in (logs or {}).items() if key.startswith("timing/")}
+        if timing and self._wandb is not None:
+            if not self._initialized:
+                self.setup(args, state, model)
+            if state.is_world_process_zero:
+                # The parent commits this same history row, supplies the global
+                # step and retains HF's handling of ordinary metrics/summaries.
+                self._wandb.log(timing, commit=False)
+            logs = {key: value for key, value in logs.items() if key not in timing}
+        return super().on_log(args, state, control, model=model, logs=logs, **kwargs)
 
 
 class TimedIterator:

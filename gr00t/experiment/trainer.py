@@ -28,6 +28,7 @@ import time
 from typing import Any, Optional
 
 import torch
+from transformers.integrations import WandbCallback
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 
@@ -40,7 +41,7 @@ from gr00t.experiment.training_optimization import (
     cache_frozen_linear_weights,
     keep_fused_adamw_on_load,
 )
-from gr00t.experiment.training_timing import TimedIterator, TrainingTiming
+from gr00t.experiment.training_timing import TimedIterator, TimingWandbCallback, TrainingTiming
 
 
 class ProfCallback(TrainerCallback):
@@ -176,6 +177,9 @@ class Gr00tTrainer(Trainer):
         timing_log_steps = kwargs.pop("timing_log_steps", 100)
         timing_sample_steps = kwargs.pop("timing_sample_steps", 5)
         super().__init__(*args, **kwargs)
+        for index, callback in enumerate(self.callback_handler.callbacks):
+            if type(callback) is WandbCallback:
+                self.callback_handler.callbacks[index] = TimingWandbCallback()
         if self.args.bf16 and not self.args.fp16:
             cache_frozen_linear_weights(self.model)
         self.timing = TrainingTiming(self, timing_log_steps, timing_sample_steps)

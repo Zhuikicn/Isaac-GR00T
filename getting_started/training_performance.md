@@ -25,24 +25,24 @@
 - `--timing-log-steps 0` 关闭新增计时，计算优化仍生效。
 - 所有指标按**一个优化器更新**计量；使用梯度累积时，前向、反向、输入准备和取 batch 时间累加该更新的所有 microbatch。
 
-启用 W&B 时，HF 回调会为指标加 `train/` 前缀，例如：
+启用 W&B 时，计时指标单独放在 `timing/` 分类，普通训练指标继续使用 `train/` 分类，例如：
 
 ```text
-train/timing/rank0/data_wait_cpu_ms
-train/timing/rank1/data_wait_cpu_ms
-train/timing/max_rank/data_wait_cpu_ms
-train/timing/rank0/forward_cuda_ms
-train/timing/rank0/backward_cuda_ms
-train/timing/rank0/optimizer_cuda_ms
+timing/rank0/data_wait_cpu_ms
+timing/rank1/data_wait_cpu_ms
+timing/max_rank/data_wait_cpu_ms
+timing/rank0/forward_cuda_ms
+timing/rank0/backward_cuda_ms
+timing/rank0/optimizer_cuda_ms
 ```
 
 计时通过现有 `Trainer.log()` → W&B 回调记录，**不另建 JSONL 或其他计时日志文件**。下次直接读取原有 `wandb/run-*/run-*.wandb` 本地记录即可；所有训练 rank 的指标放在同一个 W&B run 中。根据实际 world size 动态生成 `rank0` 到 `rankN-1`，单卡、双卡、四卡使用同一份实现；没有写死卡数。
 
-`train/timing/world_size` 记录本次训练实际参与的进程数，汇总频率不随卡数增加；每次汇总携带所有 rank 的指标。
+`timing/world_size` 记录本次训练实际参与的进程数，汇总频率不随卡数增加；每次汇总携带所有 rank 的指标。计时曲线仍使用 `train/global_step` 作为横轴，与 loss 对齐。旧 run 已写入的 `train/timing/*` 历史记录不会自动改名；新启动任务使用上述分类。
 
 ## 指标含义
 
-下表省略 `train/timing/rankN/` 前缀，时间单位均为毫秒：
+下表省略 `timing/rankN/` 前缀，时间单位均为毫秒：
 
 | 指标 | 含义 |
 |---|---|
