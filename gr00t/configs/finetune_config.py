@@ -191,6 +191,12 @@ class FinetuneConfig:
     dataloader_num_workers: int = 2
     """Number of parallel worker processes used for data loading."""
 
+    timing_log_steps: int = 100
+    """Log aggregated training timings every N optimizer steps; 0 disables timing."""
+
+    timing_sample_steps: int = 5
+    """Number of optimizer steps per timing window sampled with CUDA events."""
+
     learning_rate: float = 1e-4
     """Peak learning rate for trainable parameters outside the LLM."""
 

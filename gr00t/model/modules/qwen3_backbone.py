@@ -498,7 +498,17 @@ class Qwen3Backbone(torch.nn.Module):
                 raise ValueError("third_loss training requires third-view teacher images")
 
         try:
-            outputs = self.model(**vl_input, output_hidden_states=True)
+            # VLA consumes hidden states, never vocabulary logits or a KV cache.
+            # An empty token index skips the unused lm_head projection while
+            # preserving Qwen's original hidden-state capture (including its
+            # final-norm semantics). Gradients may still flow through a frozen
+            # LLM to the third-view head, so do not use no_grad here.
+            outputs = self.model(
+                **vl_input,
+                output_hidden_states=True,
+                logits_to_keep=vl_input["input_ids"].new_empty((0,)),
+                use_cache=False,
+            )
         finally:
             if handle is not None:
                 handle.remove()

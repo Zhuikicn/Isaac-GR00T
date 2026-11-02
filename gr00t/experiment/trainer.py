@@ -13,29 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Trainer with simple profiling utilities.
-
-This subclass of HuggingFace's ``Trainer`` measures:
-1. Data loading latency (time between the end of the previous ``training_step`` and
-   the start of the current ``training_step``).
-2. Forward-pass latency (time spent inside the base ``training_step`` implementation,
-   which essentially wraps the model's forward / loss computation).
-
-The statistics are logged via ``self.log`` every ``profile_log_interval`` steps and
-also sent to the standard ``logging`` logger.  This is *not* meant to be a fully
-fledged profiler – it is a quick, lightweight way to confirm whether the training
-pipeline is bottlenecked by data loading or by the model's computation.
-"""
+"""GR00T Trainer with shared training optimizations and sampled per-rank timing."""
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 import math
 import os
 import queue
 import threading
-from copy import deepcopy
+import time
 from typing import Any, Optional
 
 import torch
@@ -47,6 +36,11 @@ from gr00t.configs.third_delta import (
     THIRD_PARAMETER_PREFIXES,
     validate_third_checkpoint_config,
 )
+from gr00t.experiment.training_optimization import (
+    cache_frozen_linear_weights,
+    keep_fused_adamw_on_load,
+)
+from gr00t.experiment.training_timing import TimedIterator, TrainingTiming
 
 
 class ProfCallback(TrainerCallback):
@@ -179,7 +173,29 @@ class Gr00tTrainer(Trainer):
         self._llm_learning_rate_for_log = None
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        timing_log_steps = kwargs.pop("timing_log_steps", 100)
+        timing_sample_steps = kwargs.pop("timing_sample_steps", 5)
         super().__init__(*args, **kwargs)
+        if self.args.bf16 and not self.args.fp16:
+            cache_frozen_linear_weights(self.model)
+        self.timing = TrainingTiming(self, timing_log_steps, timing_sample_steps)
+        self.add_callback(self.timing)
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        self.timing.begin_update(self.state.global_step)
+        if self.timing.enabled:
+            epoch_iterator = TimedIterator(epoch_iterator, self.timing)
+        return super().get_batch_samples(epoch_iterator, num_batches, device)
+
+    def _prepare_inputs(self, inputs):
+        with self.timing.phase("input_prepare"):
+            return super()._prepare_inputs(inputs)
+
+    def _save_checkpoint(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = super()._save_checkpoint(*args, **kwargs)
+        self.timing.checkpoint((time.perf_counter() - start) * 1000)
+        return result
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # Match the default multi-GPU DeepSpeed BF16 weights without casting
@@ -208,6 +224,10 @@ class Gr00tTrainer(Trainer):
             return self.optimizer
 
         optimizer = super().create_optimizer()
+        if isinstance(optimizer, torch.optim.AdamW) and all(
+            group.get("fused") for group in optimizer.param_groups
+        ):
+            optimizer.register_load_state_dict_pre_hook(keep_fused_adamw_on_load)
         backbone = getattr(self.model, "backbone", None)
         language_model = getattr(getattr(backbone, "model", None), "language_model", None)
         llm_param_ids = (
@@ -355,7 +375,10 @@ class Gr00tTrainer(Trainer):
                 os.path.join(latest_checkpoint, TRAINER_STATE_NAME)
             )
 
-        return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        try:
+            return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        finally:
+            self.timing.close()
 
     def _issue_warnings_after_load(self, load_result):
         """A resumed third branch must be complete and match the selected architecture."""
@@ -394,12 +417,13 @@ class Gr00tTrainer(Trainer):
         """
 
         # Use parent implementation to preserve built-in functionality.
-        loss, outputs = super().compute_loss(
-            model,
-            inputs,
-            return_outputs=True,
-            num_items_in_batch=num_items_in_batch,
-        )
+        with self.timing.phase("forward"):
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()

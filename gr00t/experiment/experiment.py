@@ -311,6 +311,8 @@ def run(config: Config):
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
         llm_learning_rate=config.training.llm_learning_rate,
+        timing_log_steps=config.training.timing_log_steps,
+        timing_sample_steps=config.training.timing_sample_steps,
     )
 
     trainer.add_callback(

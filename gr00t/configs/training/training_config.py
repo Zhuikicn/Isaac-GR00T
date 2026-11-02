@@ -68,6 +68,8 @@ class TrainingConfig:
 
     # Logging and saving
     logging_steps: int = 10
+    timing_log_steps: int = 100  # First update, then every N optimizer steps; 0 disables.
+    timing_sample_steps: int = 5  # CUDA samples spread across each timing window.
     save_steps: int = 1000
     save_total_limit: int = 5
 

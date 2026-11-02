@@ -164,12 +164,14 @@ if __name__ == "__main__":
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = resolve_local_hf_snapshot(ft_config.base_model_path)
     config.training.transformers_local_files_only = True
-    config.training.optim = "adamw_torch"
+    config.training.optim = "adamw_torch_fused"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
     config.training.llm_learning_rate = ft_config.llm_learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
+    config.training.timing_log_steps = ft_config.timing_log_steps
+    config.training.timing_sample_steps = ft_config.timing_sample_steps
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
     config.training.save_total_limit = ft_config.save_total_limit
