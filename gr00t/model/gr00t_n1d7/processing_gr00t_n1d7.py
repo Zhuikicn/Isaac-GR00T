@@ -43,6 +43,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
 from gr00t.data.utils import parse_modality_configs, to_json_serializable
+from gr00t.model.modules.qwen3_metadata import prepare_qwen3_metadata
 from gr00t.model.modules.third_delta import THIRD_QUERY_COUNT, build_third_layout
 
 from .image_augmentations import (
@@ -238,7 +239,9 @@ class Gr00tN1d7DataCollator:
             raise ValueError("third_prediction_target must be third or delta")
         self.third_prediction_target = third_prediction_target
 
-    def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
+    def __call__(
+        self, features: list[Dict[str, Any]], *, prepare_metadata: bool = True
+    ) -> BatchFeature:
         batch = {}
         keys = list(set().union(*(elem.keys() for elem in features)))
 
@@ -303,6 +306,15 @@ class Gr00tN1d7DataCollator:
             else:
                 # state, state_mask, action and action_mask - stack to form batch dimension
                 batch[key] = torch.from_numpy(np.stack(values))
+        if prepare_metadata and "image_grid_thw" in batch:
+            tokenizer = self.processor.tokenizer
+            batch["qwen_metadata"] = prepare_qwen3_metadata(
+                batch,
+                self.processor.image_processor.merge_size,
+                tokenizer.convert_tokens_to_ids("<|image_pad|>"),
+                tokenizer.convert_tokens_to_ids("<|video_pad|>"),
+                tokenizer.convert_tokens_to_ids("<|vision_start|>"),
+            )
         return BatchFeature(data={"inputs": batch})
 
     def __str__(self):

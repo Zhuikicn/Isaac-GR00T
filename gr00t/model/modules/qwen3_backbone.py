@@ -389,12 +389,32 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def enable_training_optimizations(self, enabled: bool = True) -> None:
+        """Enable shared instance adapters without changing checkpoint parameters."""
+        from gr00t.model.modules.qwen3_training import install
+
+        install(self.model, enabled)
+        self._training_optimizations_enabled = enabled
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
+        if getattr(self, "_training_optimizations_enabled", False):
+            from gr00t.model.modules.qwen3_training import training_batch
+
+            with training_batch(self.model, vl_input, enabled=self.training):
+                return self._forward(vl_input)
+        return self._forward(vl_input)
+
+    def _forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         third_mask = vl_input.get("third_view_token_mask")
         third_inputs = vl_input
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
+        metadata = getattr(self.model.model, "_gr00t_batch_metadata", None)
+        if metadata is not None:
+            vl_input["position_ids"] = metadata.position_ids.to(
+                vl_input["input_ids"].device, non_blocking=True
+            )
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
         visual_outputs = {}
@@ -443,7 +463,13 @@ class Qwen3Backbone(torch.nn.Module):
                     raise ValueError("Third-view pixels require grid and sample/time metadata")
                 with torch.no_grad():
                     teacher_features = self.model.visual(
-                        teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
+                        teacher_pixels.to(self.model.visual.dtype),
+                        grid_thw=teacher_grid,
+                        **(
+                            {"metadata": metadata.teacher, "collect_deepstack": False}
+                            if metadata is not None
+                            else {}
+                        ),
                     )[0].detach()
 
             elif self.training:
@@ -452,13 +478,15 @@ class Qwen3Backbone(torch.nn.Module):
             def compensate_main_visual(_module, _inputs, output):
                 main, metrics = compensate_visual_tokens(
                     output[0],
-                    vl_input["image_grid_thw"],
-                    image_map,
+                    metadata.main.grid if metadata is not None else vl_input["image_grid_thw"],
+                    metadata.image_map if metadata is not None else image_map,
                     self.third_head,
                     self.model.config.vision_config.spatial_merge_size,
                     teacher_features,
-                    teacher_grid,
-                    teacher_map,
+                    metadata.teacher.grid
+                    if metadata is not None and metadata.teacher is not None
+                    else teacher_grid,
+                    metadata.teacher_map if metadata is not None else teacher_map,
                     framework=self.third_framework,
                     prediction_target=self.third_prediction_target,
                 )
@@ -479,7 +507,13 @@ class Qwen3Backbone(torch.nn.Module):
                     raise ValueError("Third-view pixels require grid and sample/time metadata")
                 with torch.no_grad():
                     teacher_features = self.model.visual(
-                        teacher_pixels.to(self.model.visual.dtype), grid_thw=teacher_grid
+                        teacher_pixels.to(self.model.visual.dtype),
+                        grid_thw=teacher_grid,
+                        **(
+                            {"metadata": metadata.teacher, "collect_deepstack": False}
+                            if metadata is not None
+                            else {}
+                        ),
                     )[0].detach()
 
                 def capture_third_target(_module, _inputs, output):

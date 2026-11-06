@@ -1018,7 +1018,10 @@ class Gr00tN1d7(PreTrainedModel):
                 vlm_content_list = [vlm_content_list]
 
             # Process all VLM contents through the collator
-            prep = self.collator([{"vlm_content": vlm} for vlm in vlm_content_list])["inputs"]
+            prep = self.collator(
+                [{"vlm_content": vlm} for vlm in vlm_content_list],
+                prepare_metadata=self.training,
+            )["inputs"]
             inputs.pop("vlm_content")
             inputs.update(prep)
 

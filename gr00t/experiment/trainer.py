@@ -182,6 +182,9 @@ class Gr00tTrainer(Trainer):
                 self.callback_handler.callbacks[index] = TimingWandbCallback()
         if self.args.bf16 and not self.args.fp16:
             cache_frozen_linear_weights(self.model)
+        backbone = getattr(self.model, "backbone", None)
+        if hasattr(backbone, "enable_training_optimizations"):
+            backbone.enable_training_optimizations()
         self.timing = TrainingTiming(self, timing_log_steps, timing_sample_steps)
         self.add_callback(self.timing)
 
